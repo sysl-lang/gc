@@ -1,0 +1,182 @@
+module sh.sysl.gc
+
+// A tracing garbage collector over storage the caller supplies.
+//
+// Reference counting cannot free a cycle, and a language with objects that point at each other
+// eventually makes one: a JavaScript closure capturing the scope that holds it, a parent holding
+// children that hold their parent, an event handler registered on the object it belongs to. `weak`
+// is the answer where the back-edge is known at the point it is written, and an interpreter running
+// somebody else's program does not have that. So it traces.
+//
+// **The collector never learns the client's types.** Every object carries a pointer to a function
+// that greys what it references, which is the same type erasure sysl's own ARC uses to put a
+// destructor behind a hook: one code path, no static type, and a heap that may hold anything. The
+// client writes one small function per object kind and nothing else.
+//
+// ## Why this runs on a microcontroller
+//
+// The hard part of a portable collector is not marking, it is finding the roots. A conservative
+// collector -- Boehm's is the one everybody reaches for -- scans the machine stack, the registers
+// and the static data segment, and every one of those is a per-target question answered by a linker
+// script and a register spill. That is why such a collector is a porting project rather than a
+// dependency.
+//
+// **This one never scans anything.** The client hands over a function that greys its roots, because
+// an interpreter already knows where they are: its value stack, its scope chain, its globals. What
+// is left needs no operating system, no libc, no threads and no memory mapping -- only a block of
+// bytes, which on a hosted machine comes from `malloc` and on a bare one is a static array. That is
+// the whole of its portability story, and it is why `requires {}` is exact.
+//
+// ## What it is not
+//
+// It is simple on purpose: mark and sweep, stop the world, non-moving, one free list, first fit, no
+// splitting and no coalescing. Storage freed by a sweep is reused; storage freed by a sweep and then
+// asked for in a smaller size is reused wastefully. Nothing here is generational and nothing has a
+// write barrier.
+//
+// **Non-moving is what makes it easy to use, and that is not a consolation prize.** An object never
+// changes address, so a client may hold a raw `*T` to a collected object anywhere -- in a local, in
+// a struct, across a call -- without a handle table and without the collector being told. A copying
+// collector buys locality and pays for it by making every one of those illegal.
+
+// What an object's trace function is handed, and what it does with it: grey everything this object
+// references, by calling `mark` on each.
+type Tracer = *extern(*u8, *Heap) -> unit
+
+// What `collect` is handed: grey every root, by calling `mark` on each.
+type Roots = *extern(*Heap) -> unit
+
+// Three words and two flags, ahead of every object.
+//
+// `gray` is the worklist link rather than a second edge in the graph, so the mark phase costs no
+// storage of its own -- an object is on the worklist or it is not, and it is threaded through the
+// header it already has.
+private struct Header
+    next: *Header
+    gray: *Header
+    trace: Tracer
+    size: usize
+    marked: bool
+    queued: bool
+
+// A heap over one contiguous block. Make it with `heap`; everything else here takes a pointer to it.
+struct Heap
+    private base: *u8
+    private cap: usize
+    private bump: usize
+    private all: *Header
+    private freelist: *Header
+    private graylist: *Header
+    private live: usize
+
+private align_up(n: usize) -> usize = (n + 15) & ~15usize
+
+private payload_of(o: *Header) -> *u8 = ptr_cast(usize(o) + sizeof(Header))
+
+private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
+
+// A heap over `cap` bytes at `base`. The block must outlive the heap and must not be touched by
+// anything else; a hosted program usually `malloc`s it once at startup, and a freestanding one
+// points at a static array.
+heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0)
+
+// Storage for one object, zero-initialized by the caller, traced by `trace` from now on.
+//
+// **The result is `null` when the heap is full**, and a caller that ignores that will write through
+// it. There is no growing: the block handed to `heap` is all there is, which is the property that
+// makes the collector usable where there is no allocator to grow with.
+//
+// **Allocation never collects.** It cannot: an object reached only from a sysl local is invisible to
+// a mark phase that traces the client's roots, so a collection triggered from inside an allocation
+// would sweep away the object the caller is midway through building. A client collects when it
+// chooses, at a point where it knows what is live -- the top of a statement loop, or a bytecode
+// dispatch boundary. See the README.
+alloc(h: *Heap, size: usize, trace: Tracer) -> *u8
+    val need = align_up(size + sizeof(Header))
+
+    var prev: *Header = null
+    var f = h.freelist
+    while f != null
+        if f.size >= need
+            if prev == null
+                h.freelist = f.next
+            else
+                prev.next = f.next
+            f.trace = trace
+            f.marked = false
+            f.queued = false
+            f.next = h.all
+            h.all = f
+            h.live += 1
+            return payload_of(f)
+        prev = f
+        f = f.next
+
+    if h.bump + need > h.cap then return null
+
+    var o: *Header = ptr_cast(usize(h.base) + h.bump)
+    h.bump += need
+    o.gray = null
+    o.trace = trace
+    o.size = need
+    o.marked = false
+    o.queued = false
+    o.next = h.all
+    h.all = o
+    h.live += 1
+    payload_of(o)
+
+// Grey one object: a `null` and an object already seen are both ignored, so a tracer may pass
+// anything it holds without checking first.
+//
+// This is the only function a client's `Tracer` needs, and the only one it may call from inside one.
+mark(h: *Heap, p: *u8)
+    if p == null then return
+    var o = header_of(p)
+    if o.marked then return
+    o.marked = true
+    if !o.queued
+        o.queued = true
+        o.gray = h.graylist
+        h.graylist = o
+
+// Grey the roots, drain the worklist, free what was not reached.
+//
+// **The drain is a loop rather than a recursion**, so a linked list a million long and a tree a
+// million deep both cost O(1) stack. That is not an optimization -- a recursive mark phase is a
+// stack overflow waiting for a client's data to get large enough, and it is the one place where
+// being simple and being correct come apart.
+collect(h: *Heap, roots: Roots)
+    roots(h)
+
+    while h.graylist != null
+        var o = h.graylist
+        h.graylist = o.gray
+        o.queued = false
+        o.trace(payload_of(o), h)
+
+    var prev: *Header = null
+    var p = h.all
+    while p != null
+        val nxt = p.next
+        if p.marked
+            p.marked = false
+            prev = p
+            p = nxt
+        else
+            if prev == null
+                h.all = nxt
+            else
+                prev.next = nxt
+            p.next = h.freelist
+            h.freelist = p
+            h.live -= 1
+            p = nxt
+end collect
+
+// How many objects are live as of the last sweep.
+live(h: *Heap) -> usize = h.live
+
+// How much of the block has been handed out at least once. It never falls: a sweep returns storage
+// to the free list rather than to the block, so this is the high-water mark and not the live total.
+used(h: *Heap) -> usize = h.bump

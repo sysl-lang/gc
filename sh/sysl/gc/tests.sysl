@@ -1,0 +1,232 @@
+module sh.sysl.gc
+@tests
+
+// What this collector claims, run by `sysl test .`.
+//
+// The client here is a miniature of the thing the package exists for: two unrelated object kinds
+// with different layouts and different tracers, reached from a root set the test controls exactly.
+// Every assertion is about what survives a collection and what does not, which is the only question
+// a collector answers.
+
+private const SLOTS: usize = 4
+
+// An object with a fixed bag of references, like a JavaScript object's properties.
+private struct Obj
+    tag: int
+    props: [SLOTS]*u8
+
+// A different layout with a different tracer, so that type erasure is exercised rather than
+// asserted: a heap holding one kind of object would pass these tests with the hook ignored.
+private struct Chain
+    step: int
+    next: *u8
+
+private trace_obj(p: *u8, h: *Heap)
+    val o: *Obj = ptr_cast(p)
+    for i in 0..<SLOTS
+        mark(h, o.props[i])
+
+private trace_chain(p: *u8, h: *Heap)
+    val c: *Chain = ptr_cast(p)
+    mark(h, c.next)
+
+private new_obj(h: *Heap, tag: int) -> *Obj
+    val raw = alloc(h, sizeof(Obj), &trace_obj)
+    assert(raw != null, "the test's block is big enough for the objects the test makes")
+    var o: *Obj = ptr_cast(raw)
+    o.tag = tag
+    for i in 0..<SLOTS
+        o.props[i] = null
+    o
+
+private new_chain(h: *Heap, step: int) -> *Chain
+    val raw = alloc(h, sizeof(Chain), &trace_chain)
+    assert(raw != null, "the test's block is big enough for the chain the test makes")
+    var c: *Chain = ptr_cast(raw)
+    c.step = step
+    c.next = null
+    c
+
+// The root set is a module-level slot the tracers below read, which is how a test says "these and
+// only these are live" without the collector knowing anything about a test.
+private var root_a: *u8 = null
+private var root_b: *u8 = null
+
+private roots_ab(h: *Heap)
+    mark(h, root_a)
+    mark(h, root_b)
+
+private no_roots(h: *Heap)
+    return
+
+private fresh(bytes: usize) -> []u8 = [0; bytes]
+
+@test("an unreachable cycle is collected, which is the whole reason to trace")
+cycle_is_collected()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val keep = new_obj(&h, 1)
+    val a = new_obj(&h, 2)
+    val b = new_obj(&h, 3)
+
+    // a and b hold each other and nothing else holds either: a reference count never reaches zero.
+    a.props[0] = ptr_cast(b)
+    b.props[0] = ptr_cast(a)
+
+    root_a = ptr_cast(keep)
+    root_b = null
+
+    assert_eq(live(&h), 3)
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1, "the cycle goes, the root stays")
+end cycle_is_collected
+
+@test("everything reachable from a root survives, however it is reached")
+reachable_survives()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val a = new_obj(&h, 1)
+    val b = new_obj(&h, 2)
+    val c = new_obj(&h, 3)
+
+    // b is reached twice and c only through b, so a correct mark visits b once and still finds c.
+    a.props[0] = ptr_cast(b)
+    a.props[1] = ptr_cast(b)
+    b.props[0] = ptr_cast(c)
+
+    root_a = ptr_cast(a)
+    root_b = null
+
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 3, "sharing is not double-freeing")
+    assert_eq(c.tag, 3, "and the far object is intact")
+end reachable_survives
+
+@test("a chain deeper than any stack marks iteratively")
+deep_chain_costs_no_stack()
+    var block = fresh(4194304)
+    var h = heap(&block[0], 4194304)
+
+    // Deep enough that a recursive mark phase would overflow before it finished.
+    val depth = 20000
+    var head = new_chain(&h, 0)
+    var tail = head
+    for i in 1..<depth
+        val link = new_chain(&h, i)
+        tail.next = ptr_cast(link)
+        tail = link
+
+    root_a = ptr_cast(head)
+    root_b = null
+
+    assert_eq(live(&h), usize(depth))
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), usize(depth), "every link is reachable and every link survives")
+
+    collect(&h, &no_roots)
+    assert_eq(live(&h), 0, "and the whole chain comes apart in one sweep")
+end deep_chain_costs_no_stack
+
+@test("swept storage is reused instead of growing the block")
+storage_is_reused()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    var i = 0
+    while i < 100
+        val junk = new_obj(&h, i)
+        i += 1
+
+    val high_water = used(&h)
+    assert_eq(live(&h), 100)
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0)
+
+    var j = 0
+    while j < 100
+        val fresh_obj = new_obj(&h, j)
+        j += 1
+
+    assert_eq(live(&h), 100)
+    assert_eq(used(&h), high_water, "the second hundred came off the free list")
+end storage_is_reused
+
+@test("two object kinds are traced by their own hooks")
+type_erasure_holds()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    // An Obj pointing at a Chain pointing at an Obj: every edge crosses a layout boundary, so a
+    // sweep that survives this one is reading the hook rather than assuming a shape.
+    val head = new_obj(&h, 1)
+    val middle = new_chain(&h, 2)
+    val far = new_obj(&h, 3)
+
+    head.props[0] = ptr_cast(middle)
+    middle.next = ptr_cast(far)
+
+    val orphan = new_chain(&h, 99)
+
+    root_a = ptr_cast(head)
+    root_b = null
+
+    assert_eq(live(&h), 4)
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 3, "the orphaned Chain goes and the reached one does not")
+    assert_eq(far.tag, 3, "traced across two layouts")
+end type_erasure_holds
+
+@test("a full heap answers null rather than writing past its block")
+exhaustion_is_reported()
+    // Room for a handful of objects and no more.
+    var block = fresh(256)
+    var h = heap(&block[0], 256)
+
+    var made = 0
+    var last: *u8 = null
+    loop
+        val p = alloc(&h, sizeof(Obj), &trace_obj)
+        if p == null then break
+        last = p
+        made += 1
+
+    assert(made > 0, "a 256-byte block fits something")
+    assert(alloc(&h, sizeof(Obj), &trace_obj) == null, "and it stays refused once full")
+    assert(used(&h) <= 256, "the high-water mark never passes the block")
+
+    // Collecting with nothing live must hand the whole lot back.
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0)
+    assert(alloc(&h, sizeof(Obj), &trace_obj) != null, "and the block is usable again")
+end exhaustion_is_reported
+
+@test("two roots each keep their own graph")
+roots_are_independent()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val a = new_obj(&h, 1)
+    val a_child = new_obj(&h, 2)
+    a.props[0] = ptr_cast(a_child)
+
+    val b = new_obj(&h, 3)
+    val b_child = new_obj(&h, 4)
+    b.props[0] = ptr_cast(b_child)
+
+    root_a = ptr_cast(a)
+    root_b = ptr_cast(b)
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 4, "both graphs held")
+
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 2, "dropping one root takes its child with it")
+    assert_eq(a_child.tag, 2, "and leaves the other graph alone")
+end roots_are_independent
