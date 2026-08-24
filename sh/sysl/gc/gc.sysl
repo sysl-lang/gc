@@ -8,10 +8,9 @@ module sh.sysl.gc
 // is the answer where the back-edge is known at the point it is written, and an interpreter running
 // somebody else's program does not have that. So it traces.
 //
-// **The collector never learns the client's types.** Every object carries a pointer to a function
-// that greys what it references, which is the same type erasure sysl's own ARC uses to put a
-// destructor behind a hook: one code path, no static type, and a heap that may hold anything. The
-// client writes one small function per object kind and nothing else.
+// **The collector never learns the client's types.** Every object points at a `Kind` describing how
+// to trace it, which is the same type erasure sysl's own ARC uses to put a destructor behind a hook:
+// one code path, no static type, and a heap that may hold anything.
 //
 // ## Why this runs on a microcontroller
 //
@@ -30,23 +29,72 @@ module sh.sysl.gc
 // ## What it is not
 //
 // It is simple on purpose: mark and sweep, stop the world, non-moving, one free list, first fit, no
-// splitting and no coalescing. Storage freed by a sweep is reused; storage freed by a sweep and then
-// asked for in a smaller size is reused wastefully. Nothing here is generational and nothing has a
-// write barrier.
+// splitting and no coalescing. Nothing here is generational and nothing has a write barrier.
 //
 // **Non-moving is what makes it easy to use, and that is not a consolation prize.** An object never
 // changes address, so a client may hold a raw `*T` to a collected object anywhere -- in a local, in
 // a struct, across a call -- without a handle table and without the collector being told. A copying
 // collector buys locality and pays for it by making every one of those illegal.
 
-// What an object's trace function is handed, and what it does with it: grey everything this object
-// references, by calling `mark` on each.
+// Grey everything this object references, by calling `mark` on each. Every object kind has one.
 type Tracer = *extern(*u8, *Heap) -> unit
+
+// Release what this object owns outside the collected heap -- a `string`, a `Buf`, a file
+// descriptor, a C allocation. Runs during the sweep that frees the object.
+//
+// **It is handed the payload and NOT the heap, which is the contract rather than an oversight.** A
+// finalizer runs while the sweep is walking the object list, so it may not allocate, may not mark,
+// and may not resurrect what it is finalizing. Taking no `*Heap` means none of those is reachable
+// from inside one, so the rule is enforced by the signature instead of by a warning in a comment.
+type Finalizer = *extern(*u8) -> unit
+
+// Clear this object's weak slots. Runs after marking is final and before the sweep, on live objects
+// only, and its one legal question is `is_live`.
+//
+// This is what a `WeakRef` is: an object whose tracer does *not* mark its target, plus a `Weaker`
+// that nulls the target once marking has decided the target is dead.
+type Weaker = *extern(*u8, *Heap) -> unit
+
+// Mark the values whose keys turned out to be live, and answer whether that marked anything new.
+//
+// **This is what makes a weak map not leak, and it is the one hook whose absence is silent.** A weak
+// map holding `key -> value` where the value refers back to its key is the ordinary case --
+// `wm.set(node, {owner: node})` -- and a collector that marks values strongly keeps that pair alive
+// for as long as the map lives, which is exactly the leak a weak map exists to prevent. Marking
+// values weakly instead is worse than the leak: a value nothing else holds would be freed while its
+// key is still in use.
+//
+// The answer is neither. A value is marked *because* its key was marked, which means marking has to
+// run again afterwards, because that value may reference a key of some other entry. `collect` loops
+// this hook and the worklist together until a pass changes nothing, and that fixpoint is what an
+// ephemeron is.
+type Ephemeron = *extern(*u8, *Heap) -> bool
 
 // What `collect` is handed: grey every root, by calling `mark` on each.
 type Roots = *extern(*Heap) -> unit
 
-// Three words and two flags, ahead of every object.
+// What the collector knows about one kind of object.
+//
+// **The hooks are here rather than in each object's header because three of the four are usually
+// absent.** An interpreter has many object kinds and most need only tracing; four function pointers
+// ahead of every allocation would spend three words each on saying "no" three times. A header
+// carries one pointer to the descriptor its kind shares, which is the arrangement every real virtual
+// machine arrives at and the reason a class pointer exists.
+//
+// `trace` is required. The other three are `null` where the kind does not need them, which is the
+// common case:
+//
+//     var plain = Kind(&trace_obj, null, null, null)
+//
+// A `Kind` must outlive every object naming it and its address must not move, so module storage or a
+// static is what it is for.
+struct Kind
+    trace: Tracer
+    finalize: Finalizer
+    weaken: Weaker
+    ephemeron: Ephemeron
+
+// Three words, a size and two flags, ahead of every object.
 //
 // `gray` is the worklist link rather than a second edge in the graph, so the mark phase costs no
 // storage of its own -- an object is on the worklist or it is not, and it is threaded through the
@@ -54,7 +102,7 @@ type Roots = *extern(*Heap) -> unit
 private struct Header
     next: *Header
     gray: *Header
-    trace: Tracer
+    kind: *Kind
     size: usize
     marked: bool
     queued: bool
@@ -80,7 +128,7 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // points at a static array.
 heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0)
 
-// Storage for one object, zero-initialized by the caller, traced by `trace` from now on.
+// Storage for one object of `kind`, initialized by the caller.
 //
 // **The result is `null` when the heap is full**, and a caller that ignores that will write through
 // it. There is no growing: the block handed to `heap` is all there is, which is the property that
@@ -91,7 +139,7 @@ heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0)
 // would sweep away the object the caller is midway through building. A client collects when it
 // chooses, at a point where it knows what is live -- the top of a statement loop, or a bytecode
 // dispatch boundary. See the README.
-alloc(h: *Heap, size: usize, trace: Tracer) -> *u8
+alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
     val need = align_up(size + sizeof(Header))
 
     var prev: *Header = null
@@ -102,7 +150,7 @@ alloc(h: *Heap, size: usize, trace: Tracer) -> *u8
                 h.freelist = f.next
             else
                 prev.next = f.next
-            f.trace = trace
+            f.kind = kind
             f.marked = false
             f.queued = false
             f.next = h.all
@@ -117,7 +165,7 @@ alloc(h: *Heap, size: usize, trace: Tracer) -> *u8
     var o: *Header = ptr_cast(usize(h.base) + h.bump)
     h.bump += need
     o.gray = null
-    o.trace = trace
+    o.kind = kind
     o.size = need
     o.marked = false
     o.queued = false
@@ -129,7 +177,7 @@ alloc(h: *Heap, size: usize, trace: Tracer) -> *u8
 // Grey one object: a `null` and an object already seen are both ignored, so a tracer may pass
 // anything it holds without checking first.
 //
-// This is the only function a client's `Tracer` needs, and the only one it may call from inside one.
+// This is the only function a `Tracer` needs, and the only one it may call.
 mark(h: *Heap, p: *u8)
     if p == null then return
     var o = header_of(p)
@@ -140,20 +188,59 @@ mark(h: *Heap, p: *u8)
         o.gray = h.graylist
         h.graylist = o
 
-// Grey the roots, drain the worklist, free what was not reached.
+// Whether marking has decided this object survives the collection now running.
+//
+// **It is meaningful only from inside a `Weaker` or an `Ephemeron`**, which is where marking is
+// finished or is between passes. Asked at any other time it reports the previous collection's
+// answer, which is `false` for everything, since a sweep clears the marks it leaves behind.
+is_live(h: *Heap, p: *u8) -> bool
+    if p == null then return false
+    header_of(p).marked
+
+private drain(h: *Heap)
+    while h.graylist != null
+        var o = h.graylist
+        h.graylist = o.gray
+        o.queued = false
+        o.kind.trace(payload_of(o), h)
+
+// Grey the roots, settle what is reachable, clear dead weak slots, then free what was not reached.
 //
 // **The drain is a loop rather than a recursion**, so a linked list a million long and a tree a
 // million deep both cost O(1) stack. That is not an optimization -- a recursive mark phase is a
 // stack overflow waiting for a client's data to get large enough, and it is the one place where
 // being simple and being correct come apart.
+//
+// The four phases, in the order they must run:
+//
+//   1. **Mark.** The roots are greyed and the worklist drains.
+//   2. **Ephemerons.** Every live kind with an `Ephemeron` hook is asked to mark the values whose
+//      keys turned out live, and the worklist drains again. That can make another key live, so it
+//      repeats until a whole pass changes nothing.
+//   3. **Weaken.** Every live kind with a `Weaker` hook clears the slots whose targets did not
+//      survive. This is after marking is final and before anything is freed, so a weak slot is never
+//      read after its target's storage has gone.
+//   4. **Sweep.** Unreached objects are finalized and returned to the free list.
 collect(h: *Heap, roots: Roots)
     roots(h)
+    drain(h)
 
-    while h.graylist != null
-        var o = h.graylist
-        h.graylist = o.gray
-        o.queued = false
-        o.trace(payload_of(o), h)
+    var changed = true
+    while changed
+        changed = false
+        var e = h.all
+        while e != null
+            if e.marked && e.kind.ephemeron != null
+                if e.kind.ephemeron(payload_of(e), h)
+                    changed = true
+            e = e.next
+        if changed then drain(h)
+
+    var w = h.all
+    while w != null
+        if w.marked && w.kind.weaken != null
+            w.kind.weaken(payload_of(w), h)
+        w = w.next
 
     var prev: *Header = null
     var p = h.all
@@ -168,11 +255,31 @@ collect(h: *Heap, roots: Roots)
                 h.all = nxt
             else
                 prev.next = nxt
+            if p.kind.finalize != null
+                p.kind.finalize(payload_of(p))
             p.next = h.freelist
             h.freelist = p
             h.live -= 1
             p = nxt
 end collect
+
+// Finalize and free every object, live or not, leaving an empty heap over the same block.
+//
+// **This is what runs at the end of a program**, and without it a finalizer that closes a file or
+// releases a `Buf` never runs for anything still reachable when the interpreter stops. Nothing is
+// traced and nothing is marked: teardown has no reachability question to answer.
+dispose(h: *Heap)
+    var p = h.all
+    while p != null
+        val nxt = p.next
+        if p.kind.finalize != null
+            p.kind.finalize(payload_of(p))
+        p.next = h.freelist
+        h.freelist = p
+        p = nxt
+    h.all = null
+    h.graylist = null
+    h.live = 0
 
 // How many objects are live as of the last sweep.
 live(h: *Heap) -> usize = h.live

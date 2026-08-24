@@ -3,12 +3,12 @@ module sh.sysl.gc
 
 // What this collector claims, run by `sysl test .`.
 //
-// The client here is a miniature of the thing the package exists for: two unrelated object kinds
-// with different layouts and different tracers, reached from a root set the test controls exactly.
-// Every assertion is about what survives a collection and what does not, which is the only question
-// a collector answers.
+// The client here is a miniature of the thing the package exists for: object kinds with different
+// layouts and different hooks, reached from a root set the test controls exactly. Every assertion is
+// about what survives a collection and what does not, which is the only question a collector answers.
 
 private const SLOTS: usize = 4
+private const ENTRIES: usize = 4
 
 // An object with a fixed bag of references, like a JavaScript object's properties.
 private struct Obj
@@ -21,6 +21,16 @@ private struct Chain
     step: int
     next: *u8
 
+// A `WeakRef`: its tracer marks nothing, and its `Weaker` nulls the target once marking has decided
+// the target is dead.
+private struct WeakRef
+    target: *u8
+
+// A `WeakMap`: keys are held weakly, and a value is marked only because its key was.
+private struct WeakMap
+    keys: [ENTRIES]*u8
+    vals: [ENTRIES]*u8
+
 private trace_obj(p: *u8, h: *Heap)
     val o: *Obj = ptr_cast(p)
     for i in 0..<SLOTS
@@ -30,8 +40,46 @@ private trace_chain(p: *u8, h: *Heap)
     val c: *Chain = ptr_cast(p)
     mark(h, c.next)
 
-private new_obj(h: *Heap, tag: int) -> *Obj
-    val raw = alloc(h, sizeof(Obj), &trace_obj)
+private trace_nothing(p: *u8, h: *Heap)
+    return
+
+private var finalized: int = 0
+
+private count_finalize(p: *u8)
+    finalized += 1
+
+private weaken_weakref(p: *u8, h: *Heap)
+    var w: *WeakRef = ptr_cast(p)
+    if w.target != null && !is_live(h, w.target)
+        w.target = null
+
+private weaken_weakmap(p: *u8, h: *Heap)
+    var m: *WeakMap = ptr_cast(p)
+    for i in 0..<ENTRIES
+        if m.keys[i] != null && !is_live(h, m.keys[i])
+            m.keys[i] = null
+            m.vals[i] = null
+
+// A value is marked because its key is live, and never otherwise. Answering `true` is what asks the
+// collector to run marking again, since this value may itself be some other entry's key.
+private ephemeron_weakmap(p: *u8, h: *Heap) -> bool
+    var m: *WeakMap = ptr_cast(p)
+    var did = false
+    for i in 0..<ENTRIES
+        if m.keys[i] != null && m.vals[i] != null
+            if is_live(h, m.keys[i]) && !is_live(h, m.vals[i])
+                mark(h, m.vals[i])
+                did = true
+    did
+
+private var obj_kind: Kind = Kind(&trace_obj, null, null, null)
+private var chain_kind: Kind = Kind(&trace_chain, null, null, null)
+private var counted_kind: Kind = Kind(&trace_obj, &count_finalize, null, null)
+private var weakref_kind: Kind = Kind(&trace_nothing, null, &weaken_weakref, null)
+private var weakmap_kind: Kind = Kind(&trace_nothing, null, &weaken_weakmap, &ephemeron_weakmap)
+
+private new_obj_of(h: *Heap, tag: int, k: *Kind) -> *Obj
+    val raw = alloc(h, sizeof(Obj), k)
     assert(raw != null, "the test's block is big enough for the objects the test makes")
     var o: *Obj = ptr_cast(raw)
     o.tag = tag
@@ -39,16 +87,34 @@ private new_obj(h: *Heap, tag: int) -> *Obj
         o.props[i] = null
     o
 
+private new_obj(h: *Heap, tag: int) -> *Obj = new_obj_of(h, tag, &obj_kind)
+
 private new_chain(h: *Heap, step: int) -> *Chain
-    val raw = alloc(h, sizeof(Chain), &trace_chain)
+    val raw = alloc(h, sizeof(Chain), &chain_kind)
     assert(raw != null, "the test's block is big enough for the chain the test makes")
     var c: *Chain = ptr_cast(raw)
     c.step = step
     c.next = null
     c
 
-// The root set is a module-level slot the tracers below read, which is how a test says "these and
-// only these are live" without the collector knowing anything about a test.
+private new_weakref(h: *Heap, target: *u8) -> *WeakRef
+    val raw = alloc(h, sizeof(WeakRef), &weakref_kind)
+    assert(raw != null, "room for a WeakRef")
+    var w: *WeakRef = ptr_cast(raw)
+    w.target = target
+    w
+
+private new_weakmap(h: *Heap) -> *WeakMap
+    val raw = alloc(h, sizeof(WeakMap), &weakmap_kind)
+    assert(raw != null, "room for a WeakMap")
+    var m: *WeakMap = ptr_cast(raw)
+    for i in 0..<ENTRIES
+        m.keys[i] = null
+        m.vals[i] = null
+    m
+
+// The root set is module storage the tracers below read, which is how a test says "these and only
+// these are live" without the collector knowing anything about a test.
 private var root_a: *u8 = null
 private var root_b: *u8 = null
 
@@ -60,6 +126,8 @@ private no_roots(h: *Heap)
     return
 
 private fresh(bytes: usize) -> []u8 = [0; bytes]
+
+// -- Reachability ------------------------------------------------------------------------------
 
 @test("an unreachable cycle is collected, which is the whole reason to trace")
 cycle_is_collected()
@@ -149,7 +217,7 @@ storage_is_reused()
 
     var j = 0
     while j < 100
-        val fresh_obj = new_obj(&h, j)
+        val again = new_obj(&h, j)
         j += 1
 
     assert_eq(live(&h), 100)
@@ -188,23 +256,20 @@ exhaustion_is_reported()
     var h = heap(&block[0], 256)
 
     var made = 0
-    var last: *u8 = null
     loop
-        val p = alloc(&h, sizeof(Obj), &trace_obj)
+        val p = alloc(&h, sizeof(Obj), &obj_kind)
         if p == null then break
-        last = p
         made += 1
 
     assert(made > 0, "a 256-byte block fits something")
-    assert(alloc(&h, sizeof(Obj), &trace_obj) == null, "and it stays refused once full")
+    assert(alloc(&h, sizeof(Obj), &obj_kind) == null, "and it stays refused once full")
     assert(used(&h) <= 256, "the high-water mark never passes the block")
 
-    // Collecting with nothing live must hand the whole lot back.
     root_a = null
     root_b = null
     collect(&h, &roots_ab)
     assert_eq(live(&h), 0)
-    assert(alloc(&h, sizeof(Obj), &trace_obj) != null, "and the block is usable again")
+    assert(alloc(&h, sizeof(Obj), &obj_kind) != null, "and the block is usable again")
 end exhaustion_is_reported
 
 @test("two roots each keep their own graph")
@@ -230,3 +295,193 @@ roots_are_independent()
     assert_eq(live(&h), 2, "dropping one root takes its child with it")
     assert_eq(a_child.tag, 2, "and leaves the other graph alone")
 end roots_are_independent
+
+// -- Finalizers --------------------------------------------------------------------------------
+
+@test("a finalizer runs for what dies and not for what survives")
+finalizer_runs_once_per_death()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+    finalized = 0
+
+    val keep = new_obj_of(&h, 1, &counted_kind)
+    val doomed_a = new_obj_of(&h, 2, &counted_kind)
+    val doomed_b = new_obj_of(&h, 3, &counted_kind)
+
+    root_a = ptr_cast(keep)
+    root_b = null
+
+    collect(&h, &roots_ab)
+    assert_eq(finalized, 2, "one per object swept, and none for the survivor")
+
+    collect(&h, &roots_ab)
+    assert_eq(finalized, 2, "a second collection does not finalize the survivor again")
+end finalizer_runs_once_per_death
+
+@test("a kind with no finalizer is swept without one")
+no_finalizer_is_not_a_null_call()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+    finalized = 0
+
+    val plain = new_obj(&h, 1)
+    val counted = new_obj_of(&h, 2, &counted_kind)
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 0, "both are gone")
+    assert_eq(finalized, 1, "and only the kind that has a finalizer ran one")
+end no_finalizer_is_not_a_null_call
+
+@test("dispose finalizes what is still live, which is what shutdown needs")
+dispose_finalizes_survivors()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+    finalized = 0
+
+    val a = new_obj_of(&h, 1, &counted_kind)
+    val b = new_obj_of(&h, 2, &counted_kind)
+    a.props[0] = ptr_cast(b)
+
+    root_a = ptr_cast(a)
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(finalized, 0, "both are reachable, so nothing has died")
+
+    dispose(&h)
+    assert_eq(finalized, 2, "teardown runs every finalizer, reachable or not")
+    assert_eq(live(&h), 0)
+end dispose_finalizes_survivors
+
+// -- Weak references ---------------------------------------------------------------------------
+
+@test("a weak reference does not keep its target alive and is cleared when it dies")
+weak_ref_is_cleared()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val target = new_obj(&h, 42)
+    val w = new_weakref(&h, ptr_cast(target))
+
+    // Only the WeakRef is rooted. A strong reference would keep the target; this must not.
+    root_a = ptr_cast(w)
+    root_b = null
+
+    assert_eq(live(&h), 2)
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 1, "the target was not kept alive by the weak reference")
+    assert(w.target == null, "and the slot was cleared rather than left dangling")
+end weak_ref_is_cleared
+
+@test("a weak reference to a live target is left alone")
+weak_ref_survives_live_target()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val target = new_obj(&h, 42)
+    val w = new_weakref(&h, ptr_cast(target))
+
+    root_a = ptr_cast(w)
+    root_b = ptr_cast(target)
+
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 2)
+    assert(w.target != null, "a live target is still there")
+    assert_eq(ptr_cast[*Obj](w.target).tag, 42, "and it is the same object")
+end weak_ref_survives_live_target
+
+// -- Ephemerons --------------------------------------------------------------------------------
+
+@test("a weak map value is kept alive by its key")
+ephemeron_key_keeps_value()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val m = new_weakmap(&h)
+    val key = new_obj(&h, 1)
+    val value = new_obj(&h, 2)
+    m.keys[0] = ptr_cast(key)
+    m.vals[0] = ptr_cast(value)
+
+    // The value is reachable ONLY through the map, and the map marks nothing itself.
+    root_a = ptr_cast(m)
+    root_b = ptr_cast(key)
+
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 3, "map, key and value all survive")
+    assert_eq(ptr_cast[*Obj](m.vals[0]).tag, 2, "and the value is intact")
+end ephemeron_key_keeps_value
+
+@test("a weak map entry whose key died is dropped, and takes its value with it")
+ephemeron_dead_key_drops_entry()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val m = new_weakmap(&h)
+    val key = new_obj(&h, 1)
+    val value = new_obj(&h, 2)
+    m.keys[0] = ptr_cast(key)
+    m.vals[0] = ptr_cast(value)
+
+    // Only the map is rooted this time.
+    root_a = ptr_cast(m)
+    root_b = null
+
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1, "the key was not held by the map, so key and value both went")
+    assert(m.keys[0] == null, "and the entry was cleared before the storage was freed")
+    assert(m.vals[0] == null)
+end ephemeron_dead_key_drops_entry
+
+@test("a value referring back to its own key does not keep the pair alive")
+ephemeron_self_reference_is_collected()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val m = new_weakmap(&h)
+    val key = new_obj(&h, 1)
+    val value = new_obj(&h, 2)
+
+    // `wm.set(node, {owner: node})` -- the ordinary shape, and the one a collector that marks weak
+    // map values strongly would keep alive for as long as the map lives. That is the leak a weak map
+    // exists to prevent, and it is invisible to every other test in this file.
+    value.props[0] = ptr_cast(key)
+    m.keys[0] = ptr_cast(key)
+    m.vals[0] = ptr_cast(value)
+
+    root_a = ptr_cast(m)
+    root_b = null
+
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1, "only the map survives; the self-referring pair is garbage")
+    assert(m.keys[0] == null)
+end ephemeron_self_reference_is_collected
+
+@test("one entry's value being another entry's key resolves by iterating")
+ephemeron_chain_reaches_fixpoint()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val m = new_weakmap(&h)
+    val k1 = new_obj(&h, 1)
+    val v1 = new_obj(&h, 2)
+    val v2 = new_obj(&h, 3)
+
+    // v1 is entry 0's value AND entry 1's key. Marking v1 because k1 is live must then make v2 live,
+    // which a single pass over the entries finds only if the entries happen to be in the right
+    // order -- so the entries are deliberately in the wrong one.
+    m.keys[1] = ptr_cast(v1)
+    m.vals[1] = ptr_cast(v2)
+    m.keys[0] = ptr_cast(k1)
+    m.vals[0] = ptr_cast(v1)
+
+    root_a = ptr_cast(m)
+    root_b = ptr_cast(k1)
+
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 4, "map, k1, v1 and v2 -- the second entry was reached by re-running")
+    assert_eq(ptr_cast[*Obj](m.vals[1]).tag, 3, "and v2 is intact")
+end ephemeron_chain_reaches_fixpoint
