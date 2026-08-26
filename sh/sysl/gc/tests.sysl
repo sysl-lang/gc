@@ -485,3 +485,57 @@ ephemeron_chain_reaches_fixpoint()
     assert_eq(live(&h), 4, "map, k1, v1 and v2 -- the second entry was reached by re-running")
     assert_eq(ptr_cast[*Obj](m.vals[1]).tag, 3, "and v2 is intact")
 end ephemeron_chain_reaches_fixpoint
+
+// -- a fresh payload is zeroed --------------------------------------------------------------------
+//
+// **These are over a block filled with 0xFF, and that is the whole point.** `fresh` hands back a
+// zeroed array, so every other test in this file runs over a heap that was already clear and would
+// pass whether `alloc` zeroed anything or not. A hosted client `malloc`s its block, and a reused one
+// holds a dead object's bytes -- neither is zero, and a client storing a `string`, a `Buf` or a `Map`
+// into raw bytes releases whatever was there, which is a bus error somewhere else entirely.
+
+private dirty(bytes: usize) -> []u8 = [255; bytes]
+
+@test("a fresh payload is zeroed, over a block that never was")
+alloc_zeroes_a_new_payload()
+    var block = dirty(65536)
+    var h = heap(&block[0], 65536)
+
+    val raw = alloc(&h, 64, &obj_kind)
+
+    assert(raw != null, "the block is big enough")
+
+    var dirt = 0
+
+    for i in 0..<64
+        if raw[i] != 0u8 then dirt += 1
+
+    assert_eq(dirt, 0, "a first assignment into this releases nothing")
+end alloc_zeroes_a_new_payload
+
+@test("a payload reused from the free list is zeroed too")
+alloc_zeroes_a_reused_payload()
+    var block = dirty(65536)
+    var h = heap(&block[0], 65536)
+
+    val first = alloc(&h, 64, &obj_kind)
+
+    for i in 0..<64
+        first[i] = 171u8
+
+    root_a = null
+    root_b = null
+
+    collect(&h, &roots_ab)
+
+    val again = alloc(&h, 64, &obj_kind)
+
+    assert_eq(usize(again), usize(first), "the swept block is what came back")
+
+    var dirt = 0
+
+    for i in 0..<64
+        if again[i] != 0u8 then dirt += 1
+
+    assert_eq(dirt, 0, "and the previous tenant's bytes are gone")
+end alloc_zeroes_a_reused_payload

@@ -44,14 +44,22 @@ type, a heap that may hold anything.
 
 ## What a collected object may hold
 
-An object's payload is **raw bytes**. `alloc` does not zero it, and on the free list it is a dead
-object's bytes, so what a client stores there has to survive being written over memory the compiler
-never initialised.
+An object's payload is **zeroed by `alloc`**, on the free-list path as well as the bump path, and
+that is what a client may rely on when it stores anything reference counted.
 
 **A reference-counted value is fine, and its finaliser is how it is given back.** A `string`, a `Buf`
 and a `Map` all work: store one in, release it by writing an empty one in `finalize`. That is what
 lets a language's string be collected — the object is the sysl string's only owner, and finalising
 takes its count to zero — without this package reimplementing string handling over raw blocks.
+
+**The zeroing is what makes that true, and until 0.2.1 it was not done.** Assigning a `string`, a
+`Buf` or a `Map` in sysl *releases the previous occupant*, so the client's first write into a payload
+releases whatever bytes were already there — a dead object's on a reused block, the allocator's
+leavings on a `malloc`ed heap. The release lands on something that is not a live reference and the
+process takes a bus error later, inside a tracer or a finaliser, a long way from the assignment that
+caused it. `sysl-lang/slate` hit exactly this: a crash in its own `mark_map` on roughly one run in
+three, which survived at all only because its heap is a zeroed static and so only the free-list path
+was ever dirty.
 
 **A counted box `&T` is NOT fine, and the failure is a segfault rather than a diagnostic.**
 

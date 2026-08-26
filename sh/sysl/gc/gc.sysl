@@ -119,6 +119,21 @@ struct Heap
 
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
 
+// Clear a fresh payload before the caller sees it.
+//
+// **This is what makes a reference-counted member safe to store, and it is not a convenience.**
+// Assigning a `string`, a `Buf` or a `Map` in sysl *releases the previous occupant* -- so a client
+// writing the first one into a payload releases whatever bytes were already there. On a block off
+// the free list those are a dead object's, of whatever kind held it last; on a `malloc`ed heap they
+// are the allocator's leavings from the very first allocation. Either way the release is applied to
+// something that is not a live reference, and the process takes a bus error inside a tracer or a
+// finaliser, a long way from the assignment that caused it.
+//
+// Zeroing costs a write per byte and removes a whole class of failure that has no diagnostic.
+private zero(p: *u8, n: usize)
+    for i in 0..<n
+        p[i] = 0u8
+
 private payload_of(o: *Header) -> *u8 = ptr_cast(usize(o) + sizeof(Header))
 
 private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
@@ -128,7 +143,10 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // points at a static array.
 heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0)
 
-// Storage for one object of `kind`, initialized by the caller.
+// Storage for one object of `kind`, zeroed, for the caller to initialize.
+//
+// **The payload is zeroed, which is what makes a reference-counted member safe to store.** See
+// `zero` above for why raw bytes are not merely untidy here but actively unsafe.
 //
 // **The result is `null` when the heap is full**, and a caller that ignores that will write through
 // it. There is no growing: the block handed to `heap` is all there is, which is the property that
@@ -156,7 +174,11 @@ alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
             f.next = h.all
             h.all = f
             h.live += 1
-            return payload_of(f)
+
+            val reused = payload_of(f)
+
+            zero(reused, size)
+            return reused
         prev = f
         f = f.next
 
@@ -172,7 +194,11 @@ alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
     o.next = h.all
     h.all = o
     h.live += 1
-    payload_of(o)
+
+    val fresh = payload_of(o)
+
+    zero(fresh, size)
+    fresh
 
 // Grey one object: a `null` and an object already seen are both ignored, so a tracer may pass
 // anything it holds without checking first.
