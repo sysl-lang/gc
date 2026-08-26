@@ -42,6 +42,39 @@ The collector never learns what `Obj` is. Every object points at the `Kind` its 
 the same type erasure sysl's own ARC uses to put a destructor behind a hook: one code path, no static
 type, a heap that may hold anything.
 
+## What a collected object may hold
+
+An object's payload is **raw bytes**. `alloc` does not zero it, and on the free list it is a dead
+object's bytes, so what a client stores there has to survive being written over memory the compiler
+never initialised.
+
+**A reference-counted value is fine, and its finaliser is how it is given back.** A `string`, a `Buf`
+and a `Map` all work: store one in, release it by writing an empty one in `finalize`. That is what
+lets a language's string be collected — the object is the sysl string's only owner, and finalising
+takes its count to zero — without this package reimplementing string handling over raw blocks.
+
+**A counted box `&T` is NOT fine, and the failure is a segfault rather than a diagnostic.**
+
+```sysl
+struct Holder
+    k: &Payload
+
+var o: *Holder = ptr_cast(gc.alloc(&h, sizeof(Holder), &kind))
+
+o.k = boxed        // segfault
+```
+
+Zeroing the payload first does not help. A `&T` is non-nullable in sysl's model, so the release its
+assignment performs on the previous occupant has nothing to guard uninitialised bytes with — and a
+struct holding one is refused by the same rule, which is the case that bites, since a syntax tree
+node is usually exactly that shape.
+
+**The way round it is an index rather than a pointer.** Keep the boxed data in an ordinary
+reference-counted structure outside the heap and store a `usize` into the object. Where the data is a
+syntax tree that is the right arrangement anyway: a tree is immutable and acyclic, which is what
+refcounting is good at, and one tree is shared by every closure made from it rather than copied into
+each. `sysl-lang/slate` does this for its function bodies.
+
 ## The four hooks
 
 `Kind` carries four, of which only the first is required. Three `null`s is the ordinary case.
