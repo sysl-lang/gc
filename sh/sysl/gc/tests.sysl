@@ -224,6 +224,54 @@ storage_is_reused()
     assert_eq(used(&h), high_water, "the second hundred came off the free list")
 end storage_is_reused
 
+@test("live_size rises with allocation and falls with a sweep, where used only ever rises")
+live_size_is_the_one_to_schedule_by()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    assert_eq(live_size(&h), 0)
+
+    var i = 0
+    while i < 100
+        val junk = new_obj(&h, i)
+        i += 1
+
+    val held = live_size(&h)
+    val high_water = used(&h)
+
+    assert(held > 0, "a hundred objects cost something")
+    assert_eq(held, high_water, "and nothing has been reused yet, so the two agree")
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+
+    // **The whole point of the pair.** A client thresholding on `used` would see the high-water mark
+    // it saw before the sweep and collect again immediately, and again after that, forever.
+    assert_eq(live_size(&h), 0, "the sweep gave every byte back")
+    assert_eq(used(&h), high_water, "while the high-water mark is where it was")
+end live_size_is_the_one_to_schedule_by
+
+@test("live_size counts what a reused block costs, not what was asked for")
+live_size_follows_the_block()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    root_a = ptr_cast(new_obj(&h, 1))
+
+    val one = live_size(&h)
+
+    root_a = null
+    collect(&h, &roots_ab)
+    assert_eq(live_size(&h), 0)
+
+    // Off the free list this time, and it costs the same as it did when it was fresh.
+    root_a = ptr_cast(new_obj(&h, 2))
+    assert_eq(live_size(&h), one)
+
+    root_a = null
+end live_size_follows_the_block
+
 @test("two object kinds are traced by their own hooks")
 type_erasure_holds()
     var block = fresh(65536)

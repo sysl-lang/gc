@@ -116,6 +116,7 @@ struct Heap
     private freelist: *Header
     private graylist: *Header
     private live: usize
+    private live_bytes: usize
 
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
 
@@ -141,7 +142,7 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // A heap over `cap` bytes at `base`. The block must outlive the heap and must not be touched by
 // anything else; a hosted program usually `malloc`s it once at startup, and a freestanding one
 // points at a static array.
-heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0)
+heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0, 0)
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
 //
@@ -175,6 +176,10 @@ alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
             h.all = f
             h.live += 1
 
+            // **The block off the free list, not what was asked for.** A reused block is whatever
+            // size it already was, and that is what it costs the heap for as long as it is held.
+            h.live_bytes += f.size
+
             val reused = payload_of(f)
 
             zero(reused, size)
@@ -194,6 +199,7 @@ alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
     o.next = h.all
     h.all = o
     h.live += 1
+    h.live_bytes += need
 
     val fresh = payload_of(o)
 
@@ -286,6 +292,7 @@ collect(h: *Heap, roots: Roots)
             p.next = h.freelist
             h.freelist = p
             h.live -= 1
+            h.live_bytes -= p.size
             p = nxt
 end collect
 
@@ -306,10 +313,27 @@ dispose(h: *Heap)
     h.all = null
     h.graylist = null
     h.live = 0
+    h.live_bytes = 0
 
 // How many objects are live as of the last sweep.
 live(h: *Heap) -> usize = h.live
 
+// How many BYTES those objects hold, headers included.
+//
+// **This is the number a client schedules collections by, and `used` is not.** A heap's limit is
+// bytes rather than objects -- a thousand large arrays and a thousand small strings cost wildly
+// different amounts of the block -- so a client deciding *when* to collect wants this one. It rises
+// with every allocation and falls with every sweep, which is exactly what a threshold needs.
+//
+// The alternative was tried and is worth naming, because the failure has no symptom but slowness:
+// a client that thresholds on `used` asks "has the heap EVER grown past N", which is true forever
+// once it is true -- so it runs a full mark-sweep at every allocation point from then on, reclaiming
+// almost nothing each time. slate did exactly that and ran 19,629 collections over a 20,000-iteration
+// loop.
+live_size(h: *Heap) -> usize = h.live_bytes
+
 // How much of the block has been handed out at least once. It never falls: a sweep returns storage
 // to the free list rather than to the block, so this is the high-water mark and not the live total.
+//
+// **It is a diagnostic, not a scheduling input** -- see `live_size` for the one to threshold on.
 used(h: *Heap) -> usize = h.bump

@@ -150,12 +150,30 @@ roots(h: *gc.Heap)
         gc.mark(h, v)
 
 // ... at the dispatch boundary, not inside alloc:
-if gc.used(&h) > threshold
+if gc.live_size(&h) > threshold
     gc.collect(&h, &roots)
+    threshold = max(Floor, gc.live_size(&h) * 2)
 ```
 
 The cost of waiting is that peak memory runs higher than it strictly needs to. The benefit is that
 the entire class of "the collector ran while I was holding a raw pointer in a local" cannot happen.
+
+### Threshold on `live_size`, and grow it by what survived
+
+**Both halves of those two lines matter, and this README recommended the wrong number until 0.2.2.**
+
+`live_size` is the bytes currently held; `used` is the high-water mark and *never falls*, because a
+sweep returns storage to the free list rather than to the block. So `if gc.used(&h) > threshold`
+asks **"has this heap ever grown past N"** — which is true forever once it is true. The client then
+runs a full mark-sweep at every dispatch boundary for the rest of the program, reclaiming almost
+nothing each time and reporting nothing wrong. slate found this the expensive way: a 20,000-iteration
+loop ran **19,629 collections**, and the only symptom was that it was slow.
+
+**A fixed threshold is the other half of the same mistake**, and it survives the first fix. Once a
+program's genuine live set sits above the constant, every collection is immediately followed by
+another. So raise the threshold to a multiple of what actually survived — the standard rule, and
+what makes collection cost proportional to garbage produced rather than to statements executed.
+A floor keeps it from thrashing on a small heap.
 
 ## Tracers live in a module, not in the entry file
 
