@@ -344,6 +344,194 @@ roots_are_independent()
     assert_eq(a_child.tag, 2, "and leaves the other graph alone")
 end roots_are_independent
 
+// -- What an allocation costs ------------------------------------------------------------------
+//
+// These two are about the allocator rather than about reachability, and they are written in the
+// only unit that holds on every machine: how many free blocks `alloc` examines. Both interleave the
+// objects they free with objects they keep, because adjacent free blocks are merged during the
+// sweep -- a run that freed everything would leave one block behind and say nothing about searching.
+
+@test("an allocation that no swept block fits examines a bounded number of them")
+alloc_does_not_walk_the_whole_free_list()
+    val cap: usize = 48 * 1024 * 1024
+    var block = fresh(cap)
+    var h = heap(&block[0], cap)
+
+    // A hundred thousand small blocks freed, each one separated from the next by a survivor.
+    var head: *Chain = null
+    var i = 0
+
+    while i < 100000
+        var keep = new_chain(&h, i)
+
+        keep.next = ptr_cast(head)
+        head = keep
+
+        val junk = new_obj(&h, i)
+
+        i += 1
+
+    root_a = ptr_cast(head)
+    root_b = null
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 100000, "the survivors are what is left")
+
+    val before = alloc_steps(&h)
+
+    // A kilobyte fits none of them, which under a single first-fit list is the worst case there is:
+    // every one of the hundred thousand is examined and rejected before the bump pointer is reached.
+    var j = 0
+
+    while j < 10000
+        val big = alloc(&h, 1024, &obj_kind)
+
+        assert(big != null, "the block has room for the larger objects")
+
+        j += 1
+
+    val walked = alloc_steps(&h) - before
+    val budget: usize = 8 * 10000
+
+    assert(walked <= budget, "a free block a request cannot use is never reached for")
+end alloc_does_not_walk_the_whole_free_list
+
+@test("a block swept from a class is handed straight back for that class")
+reuse_of_a_class_costs_one_look()
+    val cap: usize = 8 * 1024 * 1024
+    var block = fresh(cap)
+    var h = heap(&block[0], cap)
+
+    var head: *Chain = null
+    var i = 0
+
+    while i < 20000
+        var keep = new_chain(&h, i)
+
+        keep.next = ptr_cast(head)
+        head = keep
+
+        val junk = new_obj(&h, i)
+
+        i += 1
+
+    root_a = ptr_cast(head)
+    root_b = null
+    collect(&h, &roots_ab)
+
+    val high_water = used(&h)
+    val before = alloc_steps(&h)
+
+    var j = 0
+
+    while j < 20000
+        val again = new_obj(&h, j)
+
+        j += 1
+
+    assert_eq(used(&h), high_water, "twenty thousand objects came off the free list")
+
+    val walked = alloc_steps(&h) - before
+    val budget: usize = 4 * 20000
+
+    assert(walked <= budget, "and each one cost a look rather than a walk")
+end reuse_of_a_class_costs_one_look
+
+// -- What a sweep gives back -------------------------------------------------------------------
+
+@test("neighbours freed in one sweep become one block, so something larger fits afterwards")
+adjacent_free_blocks_merge()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    // Small objects until the block is full, and every one of them dies.
+    var made = 0
+
+    loop
+        val p = alloc(&h, sizeof(Obj), &obj_kind)
+
+        if p == null then break
+
+        made += 1
+
+    assert(made > 0, "a 64K block fits a good few")
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0)
+
+    val high_water = used(&h)
+
+    // Nothing in this heap was ever four kilobytes, and the bump pointer has nothing left to give.
+    // The only way to answer is out of a run of merged neighbours.
+    val big = alloc(&h, 4096, &obj_kind)
+
+    assert(big != null, "a run of merged neighbours holds what no one of them could")
+    assert_eq(used(&h), high_water, "and it came out of that run rather than out of fresh block")
+end adjacent_free_blocks_merge
+
+@test("a block handed to a smaller request gives its remainder back")
+a_split_block_leaves_the_rest_usable()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val big = alloc(&h, 8192, &obj_kind)
+
+    assert(big != null, "the block fits eight kilobytes")
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+
+    val high_water = used(&h)
+    var i = 0
+
+    while i < 64
+        val small = alloc(&h, 64, &obj_kind)
+
+        assert(small != null, "each one comes out of what the big block left")
+
+        i += 1
+
+    assert_eq(used(&h), high_water, "sixty-four small objects, and the block never grew")
+end a_split_block_leaves_the_rest_usable
+
+@test("a heap filled with mixed sizes, swept and filled again holds exactly as much")
+exhaustion_survives_a_round_trip()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    var first = 0
+
+    loop
+        val p = alloc(&h, 48 + 240 * usize(first % 3), &obj_kind)
+
+        if p == null then break
+
+        first += 1
+
+    assert(first > 0, "the block fits a mixture")
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0)
+    assert_eq(live_size(&h), 0)
+
+    var again = 0
+
+    loop
+        val p = alloc(&h, 48 + 240 * usize(again % 3), &obj_kind)
+
+        if p == null then break
+
+        again += 1
+
+    assert_eq(again, first, "the same mixture fits a second time, so the sweep lost nothing")
+    assert(used(&h) <= 65536, "and the high-water mark never passes the block")
+end exhaustion_survives_a_round_trip
+
 // -- Finalizers --------------------------------------------------------------------------------
 
 @test("a finalizer runs for what dies and not for what survives")
@@ -587,3 +775,34 @@ alloc_zeroes_a_reused_payload()
 
     assert_eq(dirt, 0, "and the previous tenant's bytes are gone")
 end alloc_zeroes_a_reused_payload
+
+@test("a payload split out of a bigger swept block is zeroed too")
+alloc_zeroes_a_split_payload()
+    var block = dirty(65536)
+    var h = heap(&block[0], 65536)
+
+    val big = alloc(&h, 8192, &obj_kind)
+
+    assert(big != null, "the block fits eight kilobytes")
+
+    for i in 0..<8192
+        big[i] = 171u8
+
+    root_a = null
+    root_b = null
+
+    collect(&h, &roots_ab)
+
+    // A small request served out of what that one left behind: a block this test has written over
+    // twice, first with the array's 0xFF and then with the object's 0xAB.
+    val small = alloc(&h, 64, &obj_kind)
+
+    assert(small != null, "the remainder is usable")
+
+    var dirt = 0
+
+    for i in 0..<64
+        if small[i] != 0u8 then dirt += 1
+
+    assert_eq(dirt, 0, "and what comes back is clear whichever block it was cut from")
+end alloc_zeroes_a_split_payload

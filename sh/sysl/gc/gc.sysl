@@ -28,8 +28,14 @@ module sh.sysl.gc
 //
 // ## What it is not
 //
-// It is simple on purpose: mark and sweep, stop the world, non-moving, one free list, first fit, no
-// splitting and no coalescing. Nothing here is generational and nothing has a write barrier.
+// It is simple on purpose: mark and sweep, stop the world, non-moving. Nothing here is generational
+// and nothing has a write barrier.
+//
+// What it is *not* simple about is the free list, and that is deliberate. A collector's sweep hands
+// back tens of thousands of blocks at a stroke, so an allocator that searches one list for a block
+// that fits gets slower in proportion to how much the last collection freed -- which is to say it
+// gets slower exactly when it has just been given the most to work with. The storage below is
+// segregated by size class for that reason; `alloc` says what it costs and why.
 //
 // **Non-moving is what makes it easy to use, and that is not a consolation prize.** An object never
 // changes address, so a client may hold a raw `*T` to a collected object anywhere -- in a local, in
@@ -94,11 +100,16 @@ struct Kind
     weaken: Weaker
     ephemeron: Ephemeron
 
-// Three words, a size and two flags, ahead of every object.
+// Three words, a size and three flags, ahead of every object.
 //
 // `gray` is the worklist link rather than a second edge in the graph, so the mark phase costs no
 // storage of its own -- an object is on the worklist or it is not, and it is threaded through the
 // header it already has.
+//
+// `free` says whether this block is storage or an object, and it is what makes the block walkable
+// end to end: every byte the bump pointer has ever handed out belongs to exactly one block whose
+// header says how long it is, so `base + 0` and every header after it tile the used part of the
+// block. That is the property the sweep's merge pass reads, and nothing else here needs it.
 private struct Header
     next: *Header
     gray: *Header
@@ -106,19 +117,207 @@ private struct Header
     size: usize
     marked: bool
     queued: bool
+    free: bool
+
+// Sizes are multiples of this, because `align_up` rounds every block to it.
+private const GRAIN: usize = 16
+
+// One bin per exact size up to `SMALL_BINS * GRAIN`, then one per power of two above it.
+//
+// **The small classes are exact, which is what makes the common case free of any search at all.** A
+// bin holds blocks of one size only, so its head either is the block to hand back or the bin is
+// empty -- no block is ever examined and rejected. Sixteen-byte spacing to a kilobyte is 64 bins,
+// and an interpreter's objects are all in there: a cons cell, a small string, a closure, an object
+// with a handful of properties.
+//
+// **Above a kilobyte exactness stops being affordable and the classes go geometric**, each bin
+// holding a range `[1024 << j, 2048 << j)`. A bin like that has to be searched, so the search is
+// bounded -- see `alloc`.
+private const SMALL_BINS: usize = 64
+private const LARGE_BINS: usize = 24
+private const NBINS: usize = 88
+private const LARGE_MIN: usize = 1024
+
+// How many blocks of a large class `alloc` examines before giving up on that class.
+private const SCAN: usize = 8
 
 // A heap over one contiguous block. Make it with `heap`; everything else here takes a pointer to it.
+//
+// **The bins are storage of the heap rather than of the module, which is not a style choice.** A
+// module-level `var` is filled by an initializer before the program's own statements run, and a
+// freestanding target has no loader to run one -- so a package that put its allocator state at
+// module scope would be refused by every board build that reached it. Here the caller holds the
+// heap, and the heap holds the bins.
 struct Heap
     private base: *u8
     private cap: usize
     private bump: usize
     private all: *Header
-    private freelist: *Header
+    private bins: [NBINS]*Header
     private graylist: *Header
     private live: usize
     private live_bytes: usize
+    private steps: usize
 
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
+
+// The smallest block that can hold a header, which is the smallest thing a split may leave behind.
+private min_block() -> usize = align_up(sizeof(Header))
+
+// Which bin a block of this size belongs in: its exact class below a kilobyte, its power of two
+// above. The last class is open-ended, so every size lands somewhere.
+private bin_of(size: usize) -> usize
+    val i = size / GRAIN
+
+    if i < SMALL_BINS then return i
+
+    var n = size / LARGE_MIN
+    var j: usize = 0
+
+    while n > 1 && j < LARGE_BINS - 1
+        n = n >> 1
+        j += 1
+
+    SMALL_BINS + j
+end bin_of
+
+// Put a block on the list for its class.
+private push_free(h: *Heap, o: *Header)
+    val b = bin_of(o.size)
+
+    o.free = true
+    o.next = h.bins[b]
+    h.bins[b] = o
+
+// Unlink a block of at least `need` bytes from bin `b`, examining at most `limit` of them.
+private take_from_bin(h: *Heap, b: usize, need: usize, limit: usize) -> *Header
+    var prev: *Header = null
+    var f = h.bins[b]
+    var seen: usize = 0
+
+    while f != null && seen < limit
+        h.steps += 1
+        seen += 1
+
+        if f.size >= need
+            if prev == null
+                h.bins[b] = f.next
+            else
+                prev.next = f.next
+            return f
+
+        prev = f
+        f = f.next
+
+    null
+end take_from_bin
+
+// Unlink the head of the first bin above `b` that has one.
+//
+// **The head is taken without its size being read, which is the point of the arrangement.** Every
+// block in a bin above `b` is larger than every block in `b`, so any of them fits a request that
+// belongs in `b` -- there is nothing to compare and nothing to reject.
+private take_larger(h: *Heap, b: usize) -> *Header
+    var j = b + 1
+
+    while j < NBINS
+        val f = h.bins[j]
+
+        if f != null
+            h.steps += 1
+            h.bins[j] = f.next
+            return f
+
+        j += 1
+
+    null
+end take_larger
+
+// Keep `need` bytes of `o` and give the remainder back as a block of its own, where there is enough
+// of it to be one.
+//
+// **Without this a class that ran out would eat a larger block whole**, and a heap that allocated a
+// kilobyte, freed it, and then wanted a dozen small objects would answer the first one out of the
+// kilobyte and be full.
+private split(h: *Heap, o: *Header, need: usize)
+    val rest = o.size - need
+
+    if rest < min_block() then return
+
+    var t: *Header = ptr_cast(usize(o) + need)
+
+    t.gray = null
+    t.kind = null
+    t.size = rest
+    t.marked = false
+    t.queued = false
+    o.size = need
+
+    push_free(h, t)
+end split
+
+// Link a block into the object list, clear the caller's bytes, and answer the payload.
+private hand_out(h: *Heap, o: *Header, kind: *Kind, size: usize) -> *u8
+    o.gray = null
+    o.kind = kind
+    o.marked = false
+    o.queued = false
+    o.free = false
+    o.next = h.all
+    h.all = o
+    h.live += 1
+
+    // **The block, not what was asked for.** A block is what it is -- a reused one trimmed to fit, a
+    // fresh one rounded up -- and that is what it costs the heap for as long as it is held.
+    h.live_bytes += o.size
+
+    val p = payload_of(o)
+
+    zero(p, size)
+    p
+end hand_out
+
+// Rebuild every bin from the block itself, merging each run of adjacent free blocks into one.
+//
+// **This is why the sweep marks a dead object free instead of linking it into a bin as it goes.**
+// Two neighbours that die in the same collection are one block of twice the size, and nothing but
+// an address-ordered pass can see that: the object list is in allocation order, and a free list is
+// in whatever order things died. Walking the block from `base` to the bump pointer is the pass that
+// can, and it costs one step per block on a sweep that already costs one step per object.
+//
+// Without it a heap of small objects could never satisfy a large request again, however much it
+// freed -- which is the failure that looks like a leak and is not one.
+private rebuild_free(h: *Heap)
+    for b in 0..<NBINS
+        h.bins[b] = null
+
+    var off: usize = 0
+    var start: usize = 0
+    var run: usize = 0
+
+    while off < h.bump
+        var o: *Header = ptr_cast(usize(h.base) + off)
+        val sz = o.size
+
+        if o.free
+            if run == 0 then start = off
+            run += sz
+        else
+            if run > 0
+                close_run(h, start, run)
+                run = 0
+
+        off += sz
+
+    if run > 0 then close_run(h, start, run)
+end rebuild_free
+
+private close_run(h: *Heap, start: usize, run: usize)
+    var o: *Header = ptr_cast(usize(h.base) + start)
+
+    o.size = run
+
+    push_free(h, o)
 
 // Clear a fresh payload before the caller sees it.
 //
@@ -142,7 +341,7 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // A heap over `cap` bytes at `base`. The block must outlive the heap and must not be touched by
 // anything else; a hosted program usually `malloc`s it once at startup, and a freestanding one
 // points at a static array.
-heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0, 0)
+heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, [null; NBINS], null, 0, 0, 0)
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
 //
@@ -160,51 +359,50 @@ heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, null, null, 0, 0)
 // dispatch boundary. See the README.
 alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
     val need = align_up(size + sizeof(Header))
+    val want = bin_of(need)
 
-    var prev: *Header = null
-    var f = h.freelist
-    while f != null
-        if f.size >= need
-            if prev == null
-                h.freelist = f.next
-            else
-                prev.next = f.next
-            f.kind = kind
-            f.marked = false
-            f.queued = false
-            f.next = h.all
-            h.all = f
-            h.live += 1
+    // **What an allocation costs, which is the whole reason the bins are here.** A request is served
+    // from its own class first: a small class is exact, so its head fits without being looked at, and
+    // a large class spans a range, so at most `SCAN` of its blocks are examined. Failing that, the
+    // head of the first class above it is taken, and every block there is larger than anything this
+    // class could hold, so it fits by construction. Either way the number of free blocks examined is
+    // bounded by a constant -- it does not grow with how much the last collection freed, which is
+    // what a single first-fit list does and why an interpreter running under one slows down as it
+    // allocates.
+    var limit = SCAN
 
-            // **The block off the free list, not what was asked for.** A reused block is whatever
-            // size it already was, and that is what it costs the heap for as long as it is held.
-            h.live_bytes += f.size
+    if want < SMALL_BINS then limit = 1
 
-            val reused = payload_of(f)
+    var f = take_from_bin(h, want, need, limit)
 
-            zero(reused, size)
-            return reused
-        prev = f
-        f = f.next
+    if f == null then f = take_larger(h, want)
 
-    if h.bump + need > h.cap then return null
+    if f != null
+        split(h, f, need)
+        return hand_out(h, f, kind, size)
 
-    var o: *Header = ptr_cast(usize(h.base) + h.bump)
-    h.bump += need
-    o.gray = null
-    o.kind = kind
-    o.size = need
-    o.marked = false
-    o.queued = false
-    o.next = h.all
-    h.all = o
-    h.live += 1
-    h.live_bytes += need
+    if h.bump + need <= h.cap
+        var o: *Header = ptr_cast(usize(h.base) + h.bump)
 
-    val fresh = payload_of(o)
+        h.bump += need
+        o.size = need
+        return hand_out(h, o, kind, size)
 
-    zero(fresh, size)
-    fresh
+    // **The bounded search is not good enough to answer `null` on**, because a large class holds a
+    // range of sizes and a block that fits may lie further down it than the scan reached. There is
+    // nothing left to be quick for, so the rest of that class is walked before the heap is declared
+    // full. A small class needs no second look: it is exact, and the classes above it were all
+    // checked at their heads.
+    // `cap` is "as many as there are": a block is at least a header long, so no bin can hold as many
+    // blocks as the heap has bytes. Written as a maximum-valued constant instead, this would not fit
+    // the `usize` of a 32-bit target -- which is where this package is meant to run.
+    f = take_from_bin(h, want, need, h.cap)
+
+    if f == null then return null
+
+    split(h, f, need)
+    hand_out(h, f, kind, size)
+end alloc
 
 // Grey one object: a `null` and an object already seen are both ignored, so a tracer may pass
 // anything it holds without checking first.
@@ -289,11 +487,12 @@ collect(h: *Heap, roots: Roots)
                 prev.next = nxt
             if p.kind.finalize != null
                 p.kind.finalize(payload_of(p))
-            p.next = h.freelist
-            h.freelist = p
+            p.free = true
             h.live -= 1
             h.live_bytes -= p.size
             p = nxt
+
+    rebuild_free(h)
 end collect
 
 // Finalize and free every object, live or not, leaving an empty heap over the same block.
@@ -307,13 +506,13 @@ dispose(h: *Heap)
         val nxt = p.next
         if p.kind.finalize != null
             p.kind.finalize(payload_of(p))
-        p.next = h.freelist
-        h.freelist = p
+        p.free = true
         p = nxt
     h.all = null
     h.graylist = null
     h.live = 0
     h.live_bytes = 0
+    rebuild_free(h)
 
 // How many objects are live as of the last sweep.
 live(h: *Heap) -> usize = h.live
@@ -337,3 +536,13 @@ live_size(h: *Heap) -> usize = h.live_bytes
 //
 // **It is a diagnostic, not a scheduling input** -- see `live_size` for the one to threshold on.
 used(h: *Heap) -> usize = h.bump
+
+// How many free blocks the allocator has looked at since the heap was made.
+//
+// **This is the allocator's cost in the one unit that matters, and it is here so that a test can
+// assert on it.** Whether an allocation is cheap is not a question about wall-clock time on the
+// machine the suite happens to run on -- it is a question about how many free blocks have to be
+// examined before one is handed back, and that number is either bounded by a constant or it is
+// proportional to how much the heap has freed. A first-fit walk over one list is the second kind and
+// reads as a performance mystery in the client; a counter makes it a failing assertion here instead.
+alloc_steps(h: *Heap) -> usize = h.steps

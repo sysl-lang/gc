@@ -195,8 +195,8 @@ type, so a `Kind` is written `var obj_kind: gc.Kind = ...`.
 
 ## What it is, exactly
 
-Mark and sweep. Stop the world. Non-moving. One free list, first fit, no splitting and no coalescing.
-No generations and no write barrier.
+Mark and sweep. Stop the world. Non-moving. Free lists segregated by size class, splitting, and
+neighbours merged during the sweep. No generations and no write barrier.
 
 **Non-moving is what makes it easy to use, and it is not a consolation prize.** An object never
 changes address, so a client may hold a raw `*T` to a collected object anywhere — in a local, in a
@@ -209,13 +209,48 @@ recursive mark phase is a stack overflow waiting for a client's data to get larg
 the one place where being simple and being correct come apart. `sysl test .` marks a 20,000-deep
 chain to hold the line.
 
+## What an allocation costs
+
+**A collector's sweep hands back tens of thousands of blocks at a stroke, so the free list is where a
+tracing collector's allocator gets into trouble.** Searching one list for a block that fits makes an
+allocation cost what the last collection freed — which is to say it gets slowest exactly when it has
+just been given the most to work with. `sysl-lang/slate` measured it at **266 µs per allocation**
+against a heap holding 115,000 swept blocks, where the same allocations on a fresh heap cost 8 ms in
+total, and a profiler put 1,421 of 1,426 samples inside `alloc`.
+
+Since **0.2.3** the free storage is segregated by size class instead:
+
+- **Below a kilobyte, one bin per exact size**, sixteen bytes apart — the granularity every block is
+  rounded to anyway. A bin holds blocks of one size, so its head either is the answer or the bin is
+  empty: nothing is examined and rejected, and the common case is a single pointer read.
+- **Above a kilobyte, one bin per power of two.** A bin like that spans a range, so at most eight of
+  its blocks are examined; failing that, the head of any larger class serves, since every block there
+  is bigger than anything the request's class could hold.
+- **A block bigger than the request is split** and the remainder goes back on the list for its own
+  class, so a freed 4 KB block does not vanish into a 32-byte object.
+- **Neighbours that are free at the end of a sweep are merged into one block.** The sweep marks dead
+  objects free and a single address-ordered pass over the block rebuilds the bins, joining every run
+  of adjacent free blocks. Nothing but an address-ordered pass can see that two blocks are adjacent,
+  and it is affordable only because the sweep is already linear.
+
+The same benchmark — sweep 115,000 × 192-byte blocks, each separated from the next by a survivor so
+that none of them can merge, then allocate 16,000 objects of a size that fits none of them — runs in
+**under 60 ms where 0.2.2 took 21.9 s** — and that whole figure includes building the 230,000
+objects and collecting over them, which the 21.9 s barely does.
+
+`gc.alloc_steps(&h)` answers how many free blocks the allocator has examined since the heap was made.
+It exists so that this is a property a test can assert on rather than a wall-clock measurement: the
+suite fills a heap, sweeps 100,000 blocks out of it, and requires that 10,000 following allocations
+examine a bounded number of blocks between them. A client can read the same number to find out
+whether its own workload is paying for a search.
+
 ## The costs, named
 
-- **First fit with no splitting.** A freed 4 KB block will serve a 32-byte request and the rest is
-  wasted until that object dies. Fine for an interpreter whose objects cluster around a few sizes;
-  not fine for wildly mixed ones.
-- **No coalescing.** Two adjacent free blocks stay two blocks, so a long run of mixed sizes
-  fragments and never un-fragments.
+- **The merge pass walks the whole block, not just the live objects.** A sweep costs a step per
+  object and then a step per block, free ones included, which is the price of never fragmenting.
+- **A large class is a range, so it is searched.** At most eight of its blocks are examined before
+  the request is served out of a larger class instead, and the rest of that class is walked only
+  when the heap is otherwise full and the answer would be `null`.
 - **Stop the world.** Collection pauses for as long as the live set takes to trace.
 - **The ephemeron pass is O(entries × passes).** It re-walks every live object with the hook until a
   pass changes nothing. Weak maps are usually few and small; a program with many large ones would
@@ -232,7 +267,8 @@ interface.
 sysl test .
 ```
 
-16 of them, and the two that matter most are checked by falsification rather than by passing: with
+26 of them, and the ones that matter most are checked by falsification rather than by passing: with
 the weak map's values marked strongly instead of through the ephemeron hook,
-`ephemeron_dead_key_drops_entry` and `ephemeron_self_reference_is_collected` both fail. A test that
-could not have failed is not evidence.
+`ephemeron_dead_key_drops_entry` and `ephemeron_self_reference_is_collected` both fail, and
+`alloc_does_not_walk_the_whole_free_list` was written against 0.2.2's allocator and failed there
+before the size classes existed. A test that could not have failed is not evidence.
