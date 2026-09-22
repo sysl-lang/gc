@@ -8,7 +8,7 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       gc { git = "github.com/sysl-lang/gc", version = "0.2.3" }
+//       gc { git = "github.com/sysl-lang/gc", version = "0.2.4" }
 //     }
 //
 // The coordinate names the package, `gc`; the module a program imports is `sh.sysl.gc`. The module
@@ -17,7 +17,7 @@
 
 package {
   name    = "gc"
-  version = "0.2.3"
+  version = "0.2.4"
 }
 
 // **`requires {}` is exact, and it is the whole reason to write this rather than bind one.**

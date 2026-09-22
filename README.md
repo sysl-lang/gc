@@ -232,6 +232,17 @@ Since **0.2.3** the free storage is segregated by size class instead:
   objects free and a single address-ordered pass over the block rebuilds the bins, joining every run
   of adjacent free blocks. Nothing but an address-ordered pass can see that two blocks are adjacent,
   and it is affordable only because the sweep is already linear.
+- **Since 0.2.4, "which is the next class above this one that has a block" is a bit scan**, not a
+  walk up the array. The heap carries two 64-bit words with a bit per class, set exactly when the
+  class has a block, and the search is a shift and a `trailing_zeros`.
+
+  **That search is the steady state rather than the exception, which is why it was worth a word of
+  storage.** The two bullets above see to it: a sweep coalesces neighbours into large blocks and a
+  split hands remainders back to large classes, so a program allocating small objects finds its own
+  class empty almost every time and starts climbing. Climbing 87 classes meant 87 dependent loads
+  per allocation. Measured on an allocate-and-drop loop at an interpreter's shape — 20 million
+  40-byte payloads over a heap collected between rounds — 0.2.4 is **2.35× faster than 0.2.3**, best
+  of five. `sysl-lang/slate`'s profile had put 6.2% of its whole run time in that one walk.
 
 The same benchmark — sweep 115,000 × 192-byte blocks, each separated from the next by a survivor so
 that none of them can merge, then allocate 16,000 objects of a size that fits none of them — runs in
@@ -267,8 +278,15 @@ interface.
 sysl test .
 ```
 
-26 of them, and the ones that matter most are checked by falsification rather than by passing: with
+31 of them, and the ones that matter most are checked by falsification rather than by passing: with
 the weak map's values marked strongly instead of through the ephemeron hook,
 `ephemeron_dead_key_drops_entry` and `ephemeron_self_reference_is_collected` both fail, and
 `alloc_does_not_walk_the_whole_free_list` was written against 0.2.2's allocator and failed there
 before the size classes existed. A test that could not have failed is not evidence.
+
+The five that came with the class mask are checked the same way. `assert_mask_agrees` reads both
+views of every class — the bit and the bin — and is run after each allocation, each sweep and each
+split, so a maintenance site left out of any of the five places that assign a bin fails it; the
+scan's own edges (the lowest class, the highest, and the boundary between the two words, where a
+shift by a whole word width would be undefined) are driven directly rather than through a heap,
+because no request can reach a 16-byte class or an 8 GB one.

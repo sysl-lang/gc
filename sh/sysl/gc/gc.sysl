@@ -1,5 +1,9 @@
 module sh.sysl.gc
 
+// For `trailing_zeros`, which is the bit scan the free-list mask is read with. A trait of the
+// language's own numbers rather than a capability: `requires {}` below stays exact.
+import sysl.math.Bits
+
 // A tracing garbage collector over storage the caller supplies.
 //
 // Reference counting cannot free a cycle, and a language with objects that point at each other
@@ -135,7 +139,7 @@ private const GRAIN: usize = 16
 // bounded -- see `alloc`.
 private const SMALL_BINS: usize = 64
 private const LARGE_BINS: usize = 24
-private const NBINS: usize = 88
+private[gc] const NBINS: usize = 88
 private const LARGE_MIN: usize = 1024
 
 // How many blocks of a large class `alloc` examines before giving up on that class.
@@ -159,7 +163,92 @@ struct Heap
     private live_bytes: usize
     private steps: usize
 
+    // Which classes have a block on them, one bit per bin, low class in the low bit. `mask_lo`
+    // covers bins 0-63 and `mask_hi` the rest.
+    //
+    // **This is what makes "the next class above this one" a constant-time question.** Without it
+    // the search for a larger block is a walk up the array looking for a head that is not null, and
+    // that walk is the steady state rather than the exception: a sweep coalesces neighbours into
+    // large blocks and a split returns the remainder to a large class, so the exact small class a
+    // request wants is usually empty and every allocation reads most of the array. With the bits
+    // the same question is a shift and a `trailing_zeros`, which is one instruction on every machine
+    // sysl targets.
+    //
+    // **The invariant is exact and total: bit `b` is set if and only if `bins[b]` is not null.**
+    // Every assignment to `bins` maintains it, and a test asserts it after each operation -- a bit
+    // set over an empty bin costs a null check and nothing worse, but a bit *clear* over a full one
+    // hides storage from the allocator for ever, and the symptom of that is a heap that answers
+    // `null` with most of its block free.
+    private mask_lo: u64
+    private mask_hi: u64
+
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
+
+// Record that bin `b` has a block on it.
+private[gc] bin_set(h: *Heap, b: usize)
+    if b < 64
+        h.mask_lo = h.mask_lo | 1u64 << u32(b)
+    else
+        h.mask_hi = h.mask_hi | 1u64 << u32(b - 64)
+
+// Record that bin `b` has none. Called where an unlink leaves a head null, and nowhere else.
+private[gc] bin_clear(h: *Heap, b: usize)
+    if b < 64
+        h.mask_lo = h.mask_lo & ~(1u64 << u32(b))
+    else
+        h.mask_hi = h.mask_hi & ~(1u64 << u32(b - 64))
+
+// The lowest non-empty class at or above `from`, or `NBINS` if there is none.
+//
+// The shift is always by less than the width of the word it is applied to -- `from` below 64 shifts
+// `mask_lo`, and at or above it shifts `mask_hi` by `from - 64`, which is at most `NBINS - 65`. A
+// shift by the whole width is undefined on the machines this compiles to, so the split is not
+// merely tidy.
+private[gc] first_bin_from(h: *Heap, from: usize) -> usize
+    if from >= NBINS then return NBINS
+
+    if from < 64
+        val lo = h.mask_lo >> u32(from)
+
+        if lo != 0u64 then return from + usize(lo.trailing_zeros())
+        if h.mask_hi != 0u64 then return 64 + usize(h.mask_hi.trailing_zeros())
+
+        return NBINS
+
+    val hi = h.mask_hi >> u32(from - 64)
+
+    if hi != 0u64 then return from + usize(hi.trailing_zeros())
+
+    NBINS
+end first_bin_from
+
+// What the mask and the bins each say about one class, and which class a request of `size` payload
+// bytes is served from.
+//
+// **These are module-visible rather than file-private because the invariant above is what the test
+// file checks, and it cannot be checked from outside.** `bins` and `Header` stay file-private -- a
+// test has no business walking a block -- so the two views of a class are answered here, in scalars,
+// and compared there. Nothing in the package's public surface grows.
+private[gc] bin_bit(h: *Heap, b: usize) -> bool
+    if b < 64 then return h.mask_lo >> u32(b) & 1u64 == 1u64
+
+    h.mask_hi >> u32(b - 64) & 1u64 == 1u64
+end bin_bit
+
+private[gc] bin_empty(h: *Heap, b: usize) -> bool = h.bins[b] == null
+
+private[gc] bin_length(h: *Heap, b: usize) -> usize
+    var n: usize = 0
+    var f = h.bins[b]
+
+    while f != null
+        n += 1
+        f = f.next
+
+    n
+end bin_length
+
+private[gc] class_of_request(size: usize) -> usize = bin_of(align_up(size + sizeof(Header)))
 
 // The smallest block that can hold a header, which is the smallest thing a split may leave behind.
 private min_block() -> usize = align_up(sizeof(Header))
@@ -188,6 +277,7 @@ private push_free(h: *Heap, o: *Header)
     o.free = true
     o.next = h.bins[b]
     h.bins[b] = o
+    bin_set(h, b)
 
 // Unlink a block of at least `need` bytes from bin `b`, examining at most `limit` of them.
 private take_from_bin(h: *Heap, b: usize, need: usize, limit: usize) -> *Header
@@ -202,6 +292,7 @@ private take_from_bin(h: *Heap, b: usize, need: usize, limit: usize) -> *Header
         if f.size >= need
             if prev == null
                 h.bins[b] = f.next
+                if f.next == null then bin_clear(h, b)
             else
                 prev.next = f.next
             return f
@@ -217,20 +308,26 @@ end take_from_bin
 // **The head is taken without its size being read, which is the point of the arrangement.** Every
 // block in a bin above `b` is larger than every block in `b`, so any of them fits a request that
 // belongs in `b` -- there is nothing to compare and nothing to reject.
+//
+// **Which bin that is comes from the mask rather than from a walk, and that is the difference
+// between a bounded cost and a cheap-looking one.** The classes above a request are searched on
+// *every* allocation whose own class is empty, and after a collection that is nearly all of them:
+// the sweep merges neighbours into large blocks and `split` gives remainders back to large classes,
+// so a request for a small object finds its exact class bare and starts climbing. Climbing meant a
+// dependent load per class, up to 87 of them, for an answer the mask gives in a shift and a count.
 private take_larger(h: *Heap, b: usize) -> *Header
-    var j = b + 1
+    val j = first_bin_from(h, b + 1)
 
-    while j < NBINS
-        val f = h.bins[j]
+    if j >= NBINS then return null
 
-        if f != null
-            h.steps += 1
-            h.bins[j] = f.next
-            return f
+    val f = h.bins[j]
 
-        j += 1
+    h.steps += 1
+    h.bins[j] = f.next
 
-    null
+    if f.next == null then bin_clear(h, j)
+
+    f
 end take_larger
 
 // Keep `need` bytes of `o` and give the remainder back as a block of its own, where there is enough
@@ -291,6 +388,9 @@ private rebuild_free(h: *Heap)
     for b in 0..<NBINS
         h.bins[b] = null
 
+    h.mask_lo = 0u64
+    h.mask_hi = 0u64
+
     var off: usize = 0
     var start: usize = 0
     var run: usize = 0
@@ -341,7 +441,7 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // A heap over `cap` bytes at `base`. The block must outlive the heap and must not be touched by
 // anything else; a hosted program usually `malloc`s it once at startup, and a freestanding one
 // points at a static array.
-heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, [null; NBINS], null, 0, 0, 0)
+heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64)
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
 //

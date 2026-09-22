@@ -532,6 +532,229 @@ exhaustion_survives_a_round_trip()
     assert(used(&h) <= 65536, "and the high-water mark never passes the block")
 end exhaustion_survives_a_round_trip
 
+// -- The non-empty-class mask ------------------------------------------------------------------
+//
+// The allocator answers "which is the lowest class above this one that has a block" from a bitmap
+// rather than by walking the bins, so the bitmap has to agree with the bins at every moment. A bit
+// set over an empty bin costs one wasted null check; a bit *clear* over a full one hides that
+// storage from the allocator permanently, and the symptom is a heap that answers `null` while most
+// of its block is free. These check the agreement itself rather than only its consequences.
+
+// The invariant, over every class: the bit is set if and only if the bin has a block.
+private assert_mask_agrees(h: *Heap, note: string)
+    for b in 0..<NBINS
+        assert(bin_bit(h, b) == !bin_empty(h, b), note)
+
+@test("the mask agrees with the bins through allocation, sweeping and splitting")
+the_mask_agrees_with_the_bins()
+    val cap: usize = 1024 * 1024
+    var block = fresh(cap)
+    var h = heap(&block[0], cap)
+
+    assert_mask_agrees(&h, "a fresh heap has no classes and no bits")
+
+    // Fresh storage, straight off the bump pointer: nothing is ever pushed to a bin.
+    var keep: *Chain = null
+    var i = 0
+
+    while i < 400
+        var c = new_chain(&h, i)
+
+        c.next = ptr_cast(keep)
+        keep = c
+
+        val junk = new_obj(&h, i)
+
+        i += 1
+
+    assert_mask_agrees(&h, "bump allocation touches no class")
+
+    // A sweep, which pushes every dead block onto the class its size belongs to.
+    root_a = ptr_cast(keep)
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_mask_agrees(&h, "after a sweep has refilled the bins")
+
+    // Reuse, which unlinks heads -- some leaving their class empty, some not.
+    var j = 0
+
+    while j < 400
+        val again = new_obj(&h, j)
+
+        assert_mask_agrees(&h, "after an allocation off the free list")
+
+        j += 1
+
+    // A large block taken for a small request, whose remainder goes back to a class of its own.
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_mask_agrees(&h, "after the second sweep")
+
+    val small = alloc(&h, 32, &obj_kind)
+
+    assert(small != null, "there is a coalesced block to split")
+    assert_mask_agrees(&h, "after a split put the remainder back")
+end the_mask_agrees_with_the_bins
+
+@test("an allocation whose own class is empty takes the next class that is not")
+an_empty_class_reaches_the_next_one()
+    val cap: usize = 256 * 1024
+    var block = fresh(cap)
+    var h = heap(&block[0], cap)
+
+    val big = alloc(&h, 16384, &obj_kind)
+
+    assert(big != null, "the block fits sixteen kilobytes")
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+
+    // One free block, in whatever class its size lands in, and every class below it empty.
+    val only = first_bin_from(&h, 0)
+
+    assert(only < NBINS, "the sweep left a free block")
+    assert_eq(bin_length(&h, only), 1, "and exactly one")
+
+    val want = class_of_request(sizeof(Obj))
+
+    assert(want < only, "a small object's own class is below it, and is empty")
+    assert_eq(bin_length(&h, want), 0)
+
+    val high_water = used(&h)
+    val before = alloc_steps(&h)
+    val small = new_obj(&h, 1)
+
+    assert_eq(used(&h), high_water, "the small object came off the free list, not the bump pointer")
+    assert_eq(alloc_steps(&h) - before, 1, "and it cost one look rather than a climb")
+    assert_mask_agrees(&h, "after reaching past an empty class")
+end an_empty_class_reaches_the_next_one
+
+@test("a class emptied by the allocation that takes its last block leaves the mask")
+the_last_block_of_a_class_clears_its_bit()
+    val cap: usize = 1024 * 1024
+    var block = fresh(cap)
+    var h = heap(&block[0], cap)
+
+    // Dead objects separated by survivors, so that no two of them merge and the class keeps them
+    // all as blocks of its own size.
+    var keep: *Chain = null
+    var i = 0
+
+    while i < 200
+        var c = new_chain(&h, i)
+
+        c.next = ptr_cast(keep)
+        keep = c
+
+        val junk = new_obj(&h, i)
+
+        i += 1
+
+    root_a = ptr_cast(keep)
+    root_b = null
+    collect(&h, &roots_ab)
+
+    val want = class_of_request(sizeof(Obj))
+    val held = bin_length(&h, want)
+
+    assert_eq(held, 200, "every dead object is a block of its own on its own class")
+    assert(bin_bit(&h, want), "so the class is in the mask")
+
+    var j: usize = 0
+
+    while j < held - 1
+        val again = new_obj(&h, int(j))
+
+        assert(bin_bit(&h, want), "the class still has blocks, so it stays in the mask")
+
+        j += 1
+
+    val last = new_obj(&h, 0)
+
+    assert(!bin_bit(&h, want), "the block that empties the class takes it out of the mask")
+    assert_eq(bin_length(&h, want), 0)
+    assert_mask_agrees(&h, "and every other class still agrees")
+end the_last_block_of_a_class_clears_its_bit
+
+@test("the bit scan answers at both ends of the mask and across its two words")
+the_bit_scan_covers_every_class()
+    var block = fresh(1024)
+    var h = heap(&block[0], 1024)
+
+    assert_eq(first_bin_from(&h, 0), NBINS, "an empty mask has no class to offer")
+
+    bin_set(&h, 0)
+    assert_eq(first_bin_from(&h, 0), 0, "the lowest class is found at the lowest bit")
+    assert_eq(first_bin_from(&h, 1), NBINS, "and nothing above it")
+
+    bin_set(&h, NBINS - 1)
+    assert_eq(first_bin_from(&h, 0), 0, "the lowest set bit wins")
+    assert_eq(first_bin_from(&h, 1), NBINS - 1, "and the highest class is reachable from below")
+    assert_eq(first_bin_from(&h, NBINS - 1), NBINS - 1, "and from itself")
+    assert_eq(first_bin_from(&h, NBINS), NBINS, "and there is nothing past the last class")
+
+    bin_clear(&h, 0)
+    assert_eq(first_bin_from(&h, 0), NBINS - 1, "a cleared bit is not found")
+
+    // The two words meet between 63 and 64, which is the boundary a shift by a whole word width
+    // would get wrong.
+    bin_clear(&h, NBINS - 1)
+    bin_set(&h, 63)
+    bin_set(&h, 64)
+
+    assert_eq(first_bin_from(&h, 0), 63, "the last class of the low word")
+    assert_eq(first_bin_from(&h, 63), 63)
+    assert_eq(first_bin_from(&h, 64), 64, "the first class of the high word")
+    assert_eq(first_bin_from(&h, 65), NBINS, "and nothing above the pair")
+
+    bin_clear(&h, 64)
+    assert_eq(first_bin_from(&h, 64), NBINS, "the high word alone decides a query that starts in it")
+    assert_eq(first_bin_from(&h, 0), 63)
+
+    bin_clear(&h, 63)
+    bin_set(&h, 64)
+    assert_eq(first_bin_from(&h, 0), 64, "a query in the low word falls through to the high one")
+end the_bit_scan_covers_every_class
+
+@test("the sweep rebuilds the mask from the blocks rather than keeping what it had")
+a_sweep_rebuilds_the_mask()
+    val cap: usize = 256 * 1024
+    var block = fresh(cap)
+    var h = heap(&block[0], cap)
+
+    var i = 0
+
+    while i < 200
+        val junk = new_obj(&h, i)
+
+        i += 1
+
+    // Bits for classes that have nothing on them, which is the state a rebuild must not preserve:
+    // the sweep clears both words and lets its own pushes refill them.
+    bin_set(&h, 0)
+    bin_set(&h, 40)
+    bin_set(&h, NBINS - 1)
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+
+    assert_mask_agrees(&h, "the rebuild answers from the blocks, so the planted bits are gone")
+    assert(first_bin_from(&h, 0) < NBINS, "and the coalesced block is in the mask it rebuilt")
+
+    // And it is the storage, not only the bookkeeping, that came back.
+    var j = 0
+
+    while j < 200
+        val again = new_obj(&h, j)
+
+        j += 1
+
+    assert_mask_agrees(&h, "after the rebuilt mask has been allocated back down")
+end a_sweep_rebuilds_the_mask
+
 // -- Finalizers --------------------------------------------------------------------------------
 
 @test("a finalizer runs for what dies and not for what survives")
