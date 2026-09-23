@@ -123,8 +123,13 @@ private struct Header
     queued: bool
     free: bool
 
+// The four constants below are module-visible rather than file-private because `tests.sysl` holds a
+// reference implementation of `bin_of` and checks the two agree at every size. A reference written
+// against its own copies of 16, 64, 24 and 1024 would agree with a `bin_of` that had drifted from
+// all four, which is not a check of anything.
+
 // Sizes are multiples of this, because `align_up` rounds every block to it.
-private const GRAIN: usize = 16
+private[gc] const GRAIN: usize = 16
 
 // One bin per exact size up to `SMALL_BINS * GRAIN`, then one per power of two above it.
 //
@@ -137,13 +142,23 @@ private const GRAIN: usize = 16
 // **Above a kilobyte exactness stops being affordable and the classes go geometric**, each bin
 // holding a range `[1024 << j, 2048 << j)`. A bin like that has to be searched, so the search is
 // bounded -- see `alloc`.
-private const SMALL_BINS: usize = 64
-private const LARGE_BINS: usize = 24
+private[gc] const SMALL_BINS: usize = 64
+private[gc] const LARGE_BINS: usize = 24
 private[gc] const NBINS: usize = 88
-private const LARGE_MIN: usize = 1024
+private[gc] const LARGE_MIN: usize = 1024
 
 // How many blocks of a large class `alloc` examines before giving up on that class.
 private const SCAN: usize = 8
+
+// How many bits a `usize` has, taken from the type rather than written as 64, so that `bin_of` is
+// as right on a 32-bit microcontroller as it is on a laptop.
+//
+// **The obvious portable spelling, `n.count_ones() + n.count_zeros()`, is a trap here.** It is what
+// `sysl.slices` uses and it is correct, but it is two population counts of a *runtime* value, and
+// arm64 has no scalar popcount -- each one is a round trip through a vector register. Measured on
+// the allocator's own benchmark it made `bin_of` slower than the shift loop it replaced. A `sizeof`
+// is answered by the compiler and costs nothing.
+private const USIZE_BITS: u32 = 8 * u32(sizeof(usize))
 
 // A heap over one contiguous block. Make it with `heap`; everything else here takes a pointer to it.
 //
@@ -255,17 +270,34 @@ private min_block() -> usize = align_up(sizeof(Header))
 
 // Which bin a block of this size belongs in: its exact class below a kilobyte, its power of two
 // above. The last class is open-ended, so every size lands somewhere.
-private bin_of(size: usize) -> usize
+//
+// **The large class is a bit scan and not a loop, which is what an allocation is measured in.** The
+// obvious way to find which power of two a size falls in is to shift it right until it is one and
+// count the shifts, and that is a loop of up to `LARGE_BINS` iterations -- twenty-three shifts and
+// twenty-three compares -- run on *every* block that goes on a list. It is easy to believe that
+// only a large request pays it, and that is the mistake: a heap in its steady state is one big free
+// block, so an ordinary small allocation splits it and pushes the large remainder back, and the
+// remainder is what the loop is run on. A sampled profile of an interpreter on this package put
+// that loop's `j += 1` as the hottest instruction in `alloc`.
+//
+// `leading_zeros` answers the same question in one instruction on every machine sysl targets, and
+// `USIZE_BITS` reads the width of the word rather than assuming 64 -- so this is as right on a
+// 32-bit microcontroller as it is on a laptop. `bin_of` is module-visible rather than file-private
+// so that `tests.sysl` can hold the loop above as a reference and assert that the two agree at
+// every size, which is the only way a rewrite like this is worth making.
+private[gc] bin_of(size: usize) -> usize
     val i = size / GRAIN
 
     if i < SMALL_BINS then return i
 
-    var n = size / LARGE_MIN
-    var j: usize = 0
+    // At least `SMALL_BINS * GRAIN`, which is `LARGE_MIN`, so `n` is at least one and its top bit
+    // exists. `leading_zeros` answers the width for zero, and a width is not a class -- the branch
+    // above is what keeps the subtraction meaningful.
+    val n = size / LARGE_MIN
+    val j = usize(USIZE_BITS - 1 - n.leading_zeros())
 
-    while n > 1 && j < LARGE_BINS - 1
-        n = n >> 1
-        j += 1
+    // The last class is open-ended: everything from `LARGE_MIN << (LARGE_BINS - 1)` up lands on it.
+    if j >= LARGE_BINS then return NBINS - 1
 
     SMALL_BINS + j
 end bin_of
@@ -353,8 +385,9 @@ private split(h: *Heap, o: *Header, need: usize)
     push_free(h, t)
 end split
 
-// Link a block into the object list, clear the caller's bytes, and answer the payload.
-private hand_out(h: *Heap, o: *Header, kind: *Kind, size: usize) -> *u8
+// Link a block into the object list, clear the caller's bytes where it asked for that, and answer
+// the payload.
+private hand_out(h: *Heap, o: *Header, kind: *Kind, size: usize, clear: bool) -> *u8
     o.gray = null
     o.kind = kind
     o.marked = false
@@ -370,7 +403,8 @@ private hand_out(h: *Heap, o: *Header, kind: *Kind, size: usize) -> *u8
 
     val p = payload_of(o)
 
-    zero(p, size)
+    if clear then zero(p, size)
+
     p
 end hand_out
 
@@ -457,7 +491,37 @@ heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, [null; NBINS], nu
 // would sweep away the object the caller is midway through building. A client collects when it
 // chooses, at a point where it knows what is live -- the top of a statement loop, or a bytecode
 // dispatch boundary. See the README.
-alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
+alloc(h: *Heap, size: usize, kind: *Kind) -> *u8 = take(h, size, kind, true)
+
+// Storage for one object of `kind`, **not** zeroed, for a caller that writes every byte of it
+// before anything can observe the block -- the collector included.
+//
+// Everything `alloc` says holds here too: the result is `null` when the heap is full, the block is
+// linked into the object list, and allocating never collects.
+//
+// **What the caller takes on, which is the whole of the difference.** The bytes handed back are
+// whatever was last in them: a dead object's fields on a block off a free list, or the host
+// allocator's leavings on a block that has never been used. So:
+//
+//   - **Every byte of `size` is written before the next allocation and before the next safepoint.**
+//     A tracer runs against this object the moment a collection starts, and it reads the payload as
+//     the object's type says to -- so a half-written payload is a tracer following a pointer that is
+//     not one. There is no window here in which "I will fill it in shortly" is safe, because the
+//     collector is the other reader and it is not scheduled by the caller.
+//   - **No reference-counted member is assigned into it first.** Assigning a `string`, a `Buf` or a
+//     `Map` in sysl releases the previous occupant, and the previous occupant is garbage. Such a
+//     member must be *initialized* by writing the raw bytes, or the object must come from `alloc`.
+//
+// **`alloc` is the right entry point unless a measurement says otherwise**, and the measurement has
+// to be of the caller rather than of this package: the win exists only where the caller was going to
+// overwrite the whole payload anyway, which is an interpreter's constructor and is not much else.
+// On this package's own allocate-and-drop benchmark the zeroing is about 30% of the time an
+// allocation costs, so the ceiling is high and the applicability is narrow.
+alloc_raw(h: *Heap, size: usize, kind: *Kind) -> *u8 = take(h, size, kind, false)
+
+// The body both entry points share. `clear` is a constant at each of the two call sites, so the
+// branch in `hand_out` is folded away rather than tested per allocation.
+private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
     val need = align_up(size + sizeof(Header))
     val want = bin_of(need)
 
@@ -479,14 +543,14 @@ alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
 
     if f != null
         split(h, f, need)
-        return hand_out(h, f, kind, size)
+        return hand_out(h, f, kind, size, clear)
 
     if h.bump + need <= h.cap
         var o: *Header = ptr_cast(usize(h.base) + h.bump)
 
         h.bump += need
         o.size = need
-        return hand_out(h, o, kind, size)
+        return hand_out(h, o, kind, size, clear)
 
     // **The bounded search is not good enough to answer `null` on**, because a large class holds a
     // range of sizes and a block that fits may lie further down it than the scan reached. There is
@@ -501,8 +565,8 @@ alloc(h: *Heap, size: usize, kind: *Kind) -> *u8
     if f == null then return null
 
     split(h, f, need)
-    hand_out(h, f, kind, size)
-end alloc
+    hand_out(h, f, kind, size, clear)
+end take
 
 // Grey one object: a `null` and an object already seen are both ignored, so a tracer may pass
 // anything it holds without checking first.

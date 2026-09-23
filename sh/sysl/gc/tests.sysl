@@ -1029,3 +1029,181 @@ alloc_zeroes_a_split_payload()
 
     assert_eq(dirt, 0, "and what comes back is clear whichever block it was cut from")
 end alloc_zeroes_a_split_payload
+
+// -- the size-class classifier --------------------------------------------------------------------
+//
+// **`bin_of` was a shift loop and is now a bit scan, and the only check worth making is that the
+// two answer the same thing.** A test written against what the classes *ought* to be is a second
+// opinion about the design, and it would pass a rewrite that was consistently wrong; a test written
+// against the implementation that shipped is the one that catches a boundary that moved. The loop
+// below is `bin_of` as `gc` 0.2.4 had it, character for character apart from its name, and it reads
+// the module's own constants so that the two cannot drift apart through a changed `GRAIN`.
+
+private bin_of_by_shifting(size: usize) -> usize
+    val i = size / GRAIN
+
+    if i < SMALL_BINS then return i
+
+    var n = size / LARGE_MIN
+    var j: usize = 0
+
+    while n > 1 && j < LARGE_BINS - 1
+        n = n >> 1
+        j += 1
+
+    SMALL_BINS + j
+end bin_of_by_shifting
+
+@test("the bit scan classifies every size below 128 kilobytes exactly as the shift loop did")
+classifier_agrees_below_128k()
+    // Exhaustive over every one of the exact small classes and the first seven geometric ones --
+    // every boundary in that range is crossed by this loop rather than being reasoned about.
+    var size: usize = 0
+    var checked = 0
+
+    while size <= 131072
+        assert_eq(bin_of(size), bin_of_by_shifting(size), "the two classifiers disagree")
+        size += 1
+        checked += 1
+
+    assert_eq(checked, 131073, "and every size in the range was asked")
+end classifier_agrees_below_128k
+
+@test("and at every class boundary above it, including the open-ended last one")
+classifier_agrees_at_every_boundary()
+    // Above 128 kilobytes the function is piecewise by powers of two, so the sizes that can
+    // disagree are the boundaries and their neighbours. This walks them to the top of a `usize`
+    // rather than to a literal, so it is the same test on a 32-bit target -- where `LARGE_MIN <<
+    // 23` does not exist and the last classes are unreachable.
+    val top: usize = ~0usize
+    var edge: usize = LARGE_MIN
+    var crossed = 0
+
+    while edge <= top / 2
+        assert_eq(bin_of(edge - 1), bin_of_by_shifting(edge - 1), "just below a boundary")
+        assert_eq(bin_of(edge), bin_of_by_shifting(edge), "on a boundary")
+        assert_eq(bin_of(edge + 1), bin_of_by_shifting(edge + 1), "just above a boundary")
+
+        edge = edge << 1
+        crossed += 1
+
+    assert_eq(bin_of(top), bin_of_by_shifting(top), "and the largest size a usize can hold")
+    assert_eq(bin_of(top), NBINS - 1, "which is the open-ended last class")
+    assert(crossed >= 21, "a 32-bit usize still crosses this many")
+end classifier_agrees_at_every_boundary
+
+@test("every size a request can be made of lands on a class that exists")
+classifier_stays_in_range()
+    var size: usize = 0
+
+    while size <= 300000
+        val b = bin_of(size)
+
+        assert(b < NBINS, "no size classifies past the last bin")
+
+        size += 997
+
+    assert_eq(bin_of(~0usize), NBINS - 1, "and the largest one lands on the last")
+end classifier_stays_in_range
+
+// -- alloc_raw ------------------------------------------------------------------------------------
+//
+// **`alloc_raw` differs from `alloc` in one thing only: it does not clear the payload.** So what
+// these check is that everything else is unchanged -- the class the block is cut from, the object
+// list it is linked into, the accounting, and that a swept raw object frees its storage like any
+// other. The one test that asserts the *absence* of the zeroing runs over a `dirty` block, where
+// "not cleared" has an observable value rather than being the same as cleared by luck.
+
+@test("alloc_raw leaves the payload as the block was, which is the whole of what it buys")
+raw_payload_is_untouched()
+    var block = dirty(65536)
+    var h = heap(&block[0], 65536)
+
+    val raw = alloc_raw(&h, 64, &obj_kind)
+
+    assert(raw != null, "the block is big enough")
+
+    var kept = 0
+
+    for i in 0..<64
+        if raw[i] == 255u8 then kept += 1
+
+    assert_eq(kept, 64, "every byte is still the array's own")
+
+    // The contract, discharged: the caller writes every byte before anything can observe the block.
+    for i in 0..<64
+        raw[i] = 0u8
+end raw_payload_is_untouched
+
+@test("a raw block is cut from the class alloc would have used, and the next one does not overlap it")
+raw_block_is_classed_like_any_other()
+    var plain = fresh(65536)
+    var hp = heap(&plain[0], 65536)
+
+    val by_alloc = alloc(&hp, 80, &obj_kind)
+
+    assert(by_alloc != null, "room for the object")
+
+    val cost = live_size(&hp)
+
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val first = alloc_raw(&h, 80, &obj_kind)
+
+    assert(first != null, "room for the object")
+
+    for i in 0..<80
+        first[i] = 0u8
+
+    assert_eq(live_size(&h), cost, "the same request costs the same block whichever entry point took it")
+    assert_eq(class_of_request(80), bin_of(cost), "and that block is the class the request asks for")
+
+    val second = alloc(&h, 80, &obj_kind)
+
+    assert(second != null, "room for the second object")
+
+    val lo = usize(first)
+    val hi = usize(second)
+
+    assert(hi >= lo + 80 || lo >= hi + 80, "the two payloads do not overlap")
+    assert_eq(live(&h), 2, "and both are on the object list")
+end raw_block_is_classed_like_any_other
+
+@test("raw objects are traced, swept and their storage reused like any other")
+raw_objects_leak_nothing()
+    var block = dirty(1048576)
+    var h = heap(&block[0], 1048576)
+
+    var round = 0
+
+    while round < 4
+        var i = 0
+
+        while i < 2000
+            val p = alloc_raw(&h, sizeof(Obj), &obj_kind)
+
+            assert(p != null, "room for the object in round")
+
+            // Every byte, before the next allocation: `tag` and then every slot the tracer reads.
+            var o: *Obj = ptr_cast(p)
+
+            o.tag = i
+
+            for s in 0..<SLOTS
+                o.props[s] = null
+
+            i += 1
+
+        root_a = null
+        root_b = null
+
+        collect(&h, &roots_ab)
+
+        assert_eq(live(&h), 0, "nothing raw survived a collection that roots nothing")
+        assert_eq(live_size(&h), 0, "and the bytes came back too")
+
+        round += 1
+
+    assert_eq(round, 4, "four rounds out of storage that only ever held one")
+end raw_objects_leak_nothing

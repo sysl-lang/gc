@@ -45,7 +45,8 @@ type, a heap that may hold anything.
 ## What a collected object may hold
 
 An object's payload is **zeroed by `alloc`**, on the free-list path as well as the bump path, and
-that is what a client may rely on when it stores anything reference counted.
+that is what a client may rely on when it stores anything reference counted. (`alloc_raw`, below, is
+the one entry point that does not, and everything in this section is what it hands to the caller.)
 
 **A reference-counted value is fine, and its finaliser is how it is given back.** A `string`, a `Buf`
 and a `Map` all work: store one in, release it by writing an empty one in `finalize`. That is what
@@ -82,6 +83,40 @@ reference-counted structure outside the heap and store a `usize` into the object
 syntax tree that is the right arrangement anyway: a tree is immutable and acyclic, which is what
 refcounting is good at, and one tree is shared by every closure made from it rather than copied into
 each. `sysl-lang/slate` does this for its function bodies.
+
+## `alloc_raw`, for a constructor that writes every byte anyway
+
+`alloc` zeroes the payload and a client's constructor then overwrites it, which is the same bytes
+written twice. `sysl-lang/slate`'s profile made that visible: `memset` plus `__bzero` was 1.87% of
+its whole run, and `new_object` did not appear under its own name at all — the zeroing *is* what a
+construction costs outside `alloc`. So, since 0.2.5:
+
+```sysl
+var o: *Obj = ptr_cast(gc.alloc_raw(h, sizeof(Obj), &obj_kind))
+o.tag = tag
+for i in 0..<4
+    o.props[i] = null        // every byte, before the next allocation
+```
+
+Everything `alloc` does, `alloc_raw` does — the class, the split, the object list, the accounting,
+`null` on a full heap — except clearing the bytes. **What the caller takes on in exchange is two
+things, and the first is not the obvious one:**
+
+- **Every byte of the payload is written before the next allocation and before the next collection.**
+  The collector is a reader of this object that the caller does not schedule: the moment a collection
+  starts, the object's `trace` runs over whatever is in the payload, and a half-written payload is a
+  tracer following something that is not a pointer. "I will fill the rest in shortly" is not safe
+  here in the way it would be with a single-threaded reader.
+- **No reference-counted member may be assigned into it first**, for the reason the section above
+  gives: the assignment releases the previous occupant, and the previous occupant is garbage. Such a
+  member is *initialized* by writing its raw bytes, or the object comes from `alloc`.
+
+**`alloc` is the right entry point unless a measurement says otherwise.** The win exists only where
+the caller was going to write the whole payload regardless — an interpreter's object constructor,
+and not much else. On this package's own allocate-and-drop benchmark, with the payload constructed
+in both arms so that the comparison is honest, `alloc_raw` is **6.4%** faster than `alloc`; a
+benchmark that allocates and never writes makes it look like 30%, and that number is not about
+anything real.
 
 ## The four hooks
 
@@ -235,6 +270,19 @@ Since **0.2.3** the free storage is segregated by size class instead:
 - **Since 0.2.4, "which is the next class above this one that has a block" is a bit scan**, not a
   walk up the array. The heap carries two 64-bit words with a bit per class, set exactly when the
   class has a block, and the search is a shift and a `trailing_zeros`.
+
+- **Since 0.2.5, "which class is this block" is a bit scan too.** Finding which power of two a size
+  falls in by shifting it right until it is one costs up to twenty-three shifts and twenty-three
+  compares; `leading_zeros` costs one instruction. It is easy to believe only a large request pays
+  for that loop, and that is the mistake: a heap in its steady state is one big free block, so an
+  *ordinary small* allocation splits it and pushes the large remainder back, and the remainder is
+  what the loop runs on. `sysl-lang/slate`'s sampled profile put that loop's `j += 1` as the single
+  hottest instruction inside `alloc`. Worth **6.7%** of an allocate-and-drop benchmark, best of five.
+
+  The width of a `usize` here comes from `sizeof`, not from `count_ones() + count_zeros()`. The
+  second is the portable spelling `sysl.slices` uses and it is correct, but it is two population
+  counts of a *runtime* value, and arm64 has no scalar popcount — written that way the rewrite came
+  out **slower** than the loop it replaced, which is the version that was measured first.
 
   **That search is the steady state rather than the exception, which is why it was worth a word of
   storage.** The two bullets above see to it: a sweep coalesces neighbours into large blocks and a
