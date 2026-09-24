@@ -197,6 +197,22 @@ struct Heap
     private mask_lo: u64
     private mask_hi: u64
 
+    // How many live objects have a kind carrying a `Weaker` hook, and how many one carrying an
+    // `Ephemeron`. Raised in `hand_out`, lowered where the sweep frees one, zeroed by `dispose`.
+    //
+    // **These are what let `collect` skip its two weak passes, and those passes are most of what a
+    // collection costs a program with no weak value in it.** Each is a walk of the whole object list,
+    // live and dead, asking every object whether its kind has the hook -- and for a program that
+    // made no weak reference and no weak map the answer is no, every time, for every object. At zero
+    // the pass is not run at all; at one or more it runs exactly as it always did.
+    private weakeners: usize
+    private ephemerals: usize
+
+    // How many times a weak pass has walked the object list since the heap was made. It is here for
+    // the same reason `steps` is: whether a collection skipped work is a question a test can answer
+    // with a count and not with a clock.
+    private weak_walks: usize
+
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
 
 // Record that bin `b` has a block on it.
@@ -401,6 +417,9 @@ private hand_out(h: *Heap, o: *Header, kind: *Kind, size: usize, clear: bool) ->
     // fresh one rounded up -- and that is what it costs the heap for as long as it is held.
     h.live_bytes += o.size
 
+    if kind.weaken != null then h.weakeners += 1
+    if kind.ephemeron != null then h.ephemerals += 1
+
     val p = payload_of(o)
 
     if clear then zero(p, size)
@@ -475,7 +494,7 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // A heap over `cap` bytes at `base`. The block must outlive the heap and must not be touched by
 // anything else; a hosted program usually `malloc`s it once at startup, and a freestanding one
 // points at a static array.
-heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64)
+heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
 //
@@ -615,13 +634,17 @@ private drain(h: *Heap)
 //      survive. This is after marking is final and before anything is freed, so a weak slot is never
 //      read after its target's storage has gone.
 //   4. **Sweep.** Unreached objects are finalized and returned to the free list.
+//
+// Phases 2 and 3 are each skipped outright where no live object's kind has their hook, which is
+// every collection of a program that holds no weak value -- see `Heap.weakeners`.
 collect(h: *Heap, roots: Roots)
     roots(h)
     drain(h)
 
-    var changed = true
+    var changed = h.ephemerals > 0
     while changed
         changed = false
+        h.weak_walks += 1
         var e = h.all
         while e != null
             if e.marked && e.kind.ephemeron != null
@@ -630,11 +653,13 @@ collect(h: *Heap, roots: Roots)
             e = e.next
         if changed then drain(h)
 
-    var w = h.all
-    while w != null
-        if w.marked && w.kind.weaken != null
-            w.kind.weaken(payload_of(w), h)
-        w = w.next
+    if h.weakeners > 0
+        h.weak_walks += 1
+        var w = h.all
+        while w != null
+            if w.marked && w.kind.weaken != null
+                w.kind.weaken(payload_of(w), h)
+            w = w.next
 
     var prev: *Header = null
     var p = h.all
@@ -651,6 +676,8 @@ collect(h: *Heap, roots: Roots)
                 prev.next = nxt
             if p.kind.finalize != null
                 p.kind.finalize(payload_of(p))
+            if p.kind.weaken != null then h.weakeners -= 1
+            if p.kind.ephemeron != null then h.ephemerals -= 1
             p.free = true
             h.live -= 1
             h.live_bytes -= p.size
@@ -676,10 +703,22 @@ dispose(h: *Heap)
     h.graylist = null
     h.live = 0
     h.live_bytes = 0
+    h.weakeners = 0
+    h.ephemerals = 0
     rebuild_free(h)
 
 // How many objects are live as of the last sweep.
 live(h: *Heap) -> usize = h.live
+
+// How many live objects have a kind with a `Weaker` hook, and how many one with an `Ephemeron`.
+// `collect` runs each weak pass only where its count is above zero.
+weak_objects(h: *Heap) -> usize = h.weakeners
+ephemeron_objects(h: *Heap) -> usize = h.ephemerals
+
+// How many times a weak pass has walked the object list since the heap was made -- one per round of
+// the ephemeron fixpoint, one per weaken pass. A collection of a heap holding no weak object adds
+// nothing to it.
+weak_walks(h: *Heap) -> usize = h.weak_walks
 
 // How many BYTES those objects hold, headers included.
 //

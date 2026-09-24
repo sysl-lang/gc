@@ -945,6 +945,195 @@ ephemeron_chain_reaches_fixpoint()
     assert_eq(ptr_cast[*Obj](m.vals[1]).tag, 3, "and v2 is intact")
 end ephemeron_chain_reaches_fixpoint
 
+// -- The weak passes run only where a weak object lives ----------------------------------------
+
+// A map that only has the ephemeron half, and so is counted by one number and not the other.
+private var ephemeron_only_kind: Kind = Kind(&trace_nothing, null, null, &ephemeron_weakmap)
+
+@test("a heap holding no weak object collects correctly and never walks for the weak passes")
+no_weak_object_skips_both_passes()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val a = new_obj(&h, 1)
+    val b = new_chain(&h, 2)
+    a.props[0] = ptr_cast(b)
+    new_obj(&h, 3)
+    new_obj_of(&h, 4, &counted_kind)
+
+    root_a = ptr_cast(a)
+    root_b = null
+
+    assert_eq(weak_objects(&h), 0)
+    assert_eq(ephemeron_objects(&h), 0)
+
+    collect(&h, &roots_ab)
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 2, "a and the chain it holds survive, the other two do not")
+    assert_eq(ptr_cast[*Chain](a.props[0]).step, 2, "and what survived is intact")
+    assert_eq(weak_walks(&h), 0, "two collections, and neither weak pass walked the object list")
+end no_weak_object_skips_both_passes
+
+@test("a weak map drops an entry whose key died and keeps a value its live key reaches, counted once")
+weak_map_is_counted_and_its_passes_run()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val m = new_weakmap(&h)
+    val live_key = new_obj(&h, 1)
+    val kept = new_obj(&h, 2)
+    val dead_key = new_obj(&h, 3)
+    val dropped = new_obj(&h, 4)
+    m.keys[0] = ptr_cast(live_key)
+    m.vals[0] = ptr_cast(kept)
+    m.keys[1] = ptr_cast(dead_key)
+    m.vals[1] = ptr_cast(dropped)
+
+    assert_eq(weak_objects(&h), 1, "one live object whose kind has a weaken hook")
+    assert_eq(ephemeron_objects(&h), 1, "and the same one has an ephemeron hook")
+
+    root_a = ptr_cast(m)
+    root_b = ptr_cast(live_key)
+
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 3, "the map, the live key and the value only that key reaches")
+    assert_eq(ptr_cast[*Obj](m.vals[0]).tag, 2, "the ephemeron-reached value survived intact")
+    assert(m.keys[1] == null, "the entry whose key died was dropped")
+    assert(m.vals[1] == null)
+    assert(weak_walks(&h) >= 2, "an ephemeron round and a weaken pass both walked")
+    assert_eq(weak_objects(&h), 1, "the map survived, so it is still counted")
+    assert_eq(ephemeron_objects(&h), 1)
+end weak_map_is_counted_and_its_passes_run
+
+@test("the count falls when the weak object dies, and the next collection skips the weak passes")
+dead_weak_object_stops_the_passes()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val keep = new_obj(&h, 1)
+    val m = new_weakmap(&h)
+    val w = new_weakref(&h, ptr_cast(keep))
+    m.keys[0] = ptr_cast(keep)
+
+    root_a = ptr_cast(keep)
+    root_b = null
+
+    assert_eq(weak_objects(&h), 2, "a weak map and a weak reference")
+    assert_eq(ephemeron_objects(&h), 1, "only the map has an ephemeron hook")
+
+    // Both weak objects are unreached. The passes still run this time -- the count is of what was
+    // live going in -- and the sweep is what lowers it.
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1)
+    assert_eq(weak_objects(&h), 0, "both weak objects died and were taken off the count")
+    assert_eq(ephemeron_objects(&h), 0)
+
+    val walked = weak_walks(&h)
+    assert(walked >= 2, "the collection that freed them still ran both passes")
+
+    new_obj(&h, 2)
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1)
+    assert_eq(weak_walks(&h), walked, "and the one after it walked for neither")
+end dead_weak_object_stops_the_passes
+
+@test("two heaps keep their own counts")
+two_heaps_count_apart()
+    var block_a = fresh(65536)
+    var block_b = fresh(65536)
+    var ha = heap(&block_a[0], 65536)
+    var hb = heap(&block_b[0], 65536)
+
+    new_weakmap(&ha)
+    new_weakref(&ha, null)
+    new_obj(&hb, 1)
+
+    assert_eq(weak_objects(&ha), 2)
+    assert_eq(ephemeron_objects(&ha), 1)
+    assert_eq(weak_objects(&hb), 0, "nothing weak was made in the second heap")
+    assert_eq(ephemeron_objects(&hb), 0)
+
+    root_a = null
+    root_b = null
+    collect(&hb, &roots_ab)
+    assert_eq(weak_walks(&hb), 0, "the second heap skips both passes whatever the first holds")
+    assert_eq(weak_objects(&ha), 2, "and collecting it leaves the first heap's count alone")
+
+    collect(&ha, &roots_ab)
+    assert(weak_walks(&ha) >= 2)
+    assert_eq(weak_objects(&ha), 0)
+end two_heaps_count_apart
+
+@test("dispose zeroes the counts")
+dispose_zeroes_the_counts()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    new_weakmap(&h)
+    new_weakref(&h, null)
+    assert_eq(weak_objects(&h), 2)
+
+    dispose(&h)
+    assert_eq(weak_objects(&h), 0)
+    assert_eq(ephemeron_objects(&h), 0)
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(weak_walks(&h), 0, "a disposed heap collects with no weak pass")
+end dispose_zeroes_the_counts
+
+@test("a kind with only a weaken hook is counted and its pass runs with no ephemeron pass")
+weaken_only_kind_counts()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val target = new_obj(&h, 1)
+    val w = new_weakref(&h, ptr_cast(target))
+
+    assert_eq(weak_objects(&h), 1)
+    assert_eq(ephemeron_objects(&h), 0)
+
+    root_a = ptr_cast(w)
+    root_b = null
+    collect(&h, &roots_ab)
+
+    assert(w.target == null, "the weaken pass ran and cleared the dead target")
+    assert_eq(weak_walks(&h), 1, "one weaken pass and no ephemeron round")
+end weaken_only_kind_counts
+
+@test("a kind with only an ephemeron hook is counted and its pass runs with no weaken pass")
+ephemeron_only_kind_counts()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    // Through `alloc_raw`, so the raw entry point is shown to count as well.
+    val raw = alloc_raw(&h, sizeof(WeakMap), &ephemeron_only_kind)
+    assert(raw != null)
+    var m: *WeakMap = ptr_cast(raw)
+    for i in 0..<ENTRIES
+        m.keys[i] = null
+        m.vals[i] = null
+
+    val key = new_obj(&h, 1)
+    val value = new_obj(&h, 2)
+    m.keys[0] = ptr_cast(key)
+    m.vals[0] = ptr_cast(value)
+
+    assert_eq(weak_objects(&h), 0)
+    assert_eq(ephemeron_objects(&h), 1)
+
+    root_a = ptr_cast(m)
+    root_b = ptr_cast(key)
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 3, "the value was reached through its live key, so the ephemeron pass ran")
+    assert_eq(ptr_cast[*Obj](m.vals[0]).tag, 2)
+    assert_eq(weak_walks(&h), 2, "two ephemeron rounds -- one that marked, one that found nothing -- and no weaken pass")
+end ephemeron_only_kind_counts
+
 // -- a fresh payload is zeroed --------------------------------------------------------------------
 //
 // **These are over a block filled with 0xFF, and that is the whole point.** `fresh` hands back a
