@@ -146,6 +146,19 @@ nothing else holds would be freed while its key is still in use. The answer is n
 marked *because* its key was marked, so marking must run again afterwards, since that value may be
 some other entry's key. `collect` loops the hook and the worklist until a pass changes nothing.
 
+**Since 0.2.6 each of those two passes runs only where a live object's kind has its hook.** Both are a
+walk of the whole object list, live and dead, and for a program holding no weak value they found
+nothing on every object of every collection. The heap counts the live objects whose kind carries a
+`weaken` and those carrying an `ephemeron` — raised as an object is handed out, lowered as the sweep
+frees one, zeroed by `dispose` — and a pass whose count is zero is not run. At one or more it runs
+exactly as it always did. `weak_objects`, `ephemeron_objects` and `weak_walks` read the two counts and
+how many times a weak pass has walked the list, which is what the tests assert on.
+
+**So a client that keeps a spare weak object alive for ever pays both passes for ever.** An
+interpreter that reserves one of each kind for an out-of-memory path should take the reserve under a
+kind without the hooks; measured in slate's `csv` benchmark, the collector went from 58 ms to 40 ms
+once its two reserves stopped counting.
+
 `dispose` finalizes everything still live and empties the heap. Without it, a finalizer that closes a
 file or releases a `Buf` never runs for anything still reachable when the program stops.
 
@@ -313,7 +326,7 @@ whether its own workload is paying for a search.
 - **Stop the world.** Collection pauses for as long as the live set takes to trace.
 - **The ephemeron pass is O(entries × passes).** It re-walks every live object with the hook until a
   pass changes nothing. Weak maps are usually few and small; a program with many large ones would
-  feel it.
+  feel it. A heap holding no live object with the hook skips the pass entirely.
 - **One block, fixed at startup.** There is no growing. `alloc` answers `null` when the block is
   full, and a caller that ignores that will write through it.
 
@@ -326,7 +339,7 @@ interface.
 sysl test .
 ```
 
-31 of them, and the ones that matter most are checked by falsification rather than by passing: with
+44 of them, and the ones that matter most are checked by falsification rather than by passing: with
 the weak map's values marked strongly instead of through the ephemeron hook,
 `ephemeron_dead_key_drops_entry` and `ephemeron_self_reference_is_collected` both fail, and
 `alloc_does_not_walk_the_whole_free_list` was written against 0.2.2's allocator and failed there
@@ -338,3 +351,6 @@ split, so a maintenance site left out of any of the five places that assign a bi
 scan's own edges (the lowest class, the highest, and the boundary between the two words, where a
 shift by a whole word width would be undefined) are driven directly rather than through a heap,
 because no request can reach a 16-byte class or an 8 GB one.
+
+The seven that came with the weak-pass counts are checked the same way: with both passes forced off,
+ten tests fail, every weak-reference and weak-map test among them.
