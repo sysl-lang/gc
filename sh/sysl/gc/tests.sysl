@@ -72,7 +72,22 @@ private ephemeron_weakmap(p: *u8, h: *Heap) -> bool
                 did = true
     did
 
+// How many objects the sweep tests make, and one counter per object for a finalizer to tick. A
+// count of calls alone would pass a sweep that finalized one object twice and another not at all;
+// a counter per tag says which object each call was handed.
+private const COUNT: usize = 120
+private var seen: [COUNT]int = [0; COUNT]
+
+private record_finalize(p: *u8)
+    val o: *Obj = ptr_cast(p)
+    seen[usize(o.tag)] += 1
+
+private clear_seen()
+    for i in 0..<COUNT
+        seen[i] = 0
+
 private var obj_kind: Kind = Kind(&trace_obj, null, null, null)
+private var recorded_kind: Kind = Kind(&trace_obj, &record_finalize, null, null)
 private var chain_kind: Kind = Kind(&trace_chain, null, null, null)
 private var counted_kind: Kind = Kind(&trace_obj, &count_finalize, null, null)
 private var weakref_kind: Kind = Kind(&trace_nothing, null, &weaken_weakref, null)
@@ -813,6 +828,187 @@ dispose_finalizes_survivors()
     assert_eq(finalized, 2, "teardown runs every finalizer, reachable or not")
     assert_eq(live(&h), 0)
 end dispose_finalizes_survivors
+
+// -- The sweep ---------------------------------------------------------------------------------
+//
+// The sweep walks the block in address order, frees what marking did not reach, relinks the object
+// list from the survivors and rebuilds the bins, all in one pass. These pin each of those halves:
+// what dies is finalized once and by its own kind, what lives is still on the list afterwards, and
+// every cell freed is one the allocator can hand out again.
+
+@test("a kind with no finalizer is swept and its storage handed back")
+plain_kind_storage_is_reused()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    for i in 0..<COUNT
+        val o = new_obj(&h, int(i))
+
+    root_a = null
+    root_b = null
+    val grown = used(&h)
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 0, "nothing was rooted")
+    assert_eq(live_size(&h), 0, "and nothing is counted as held")
+
+    for i in 0..<COUNT
+        val o = new_obj(&h, int(i))
+
+    assert_eq(used(&h), grown, "the second set fits in exactly what the first one left")
+    assert_eq(live(&h), COUNT)
+end plain_kind_storage_is_reused
+
+@test("a finalizer is called exactly once for each dead object, and handed that object")
+finalizer_once_per_dead_object()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+    clear_seen()
+
+    var kept: *Obj = null
+    for i in 0..<COUNT
+        val o = new_obj_of(&h, int(i), &recorded_kind)
+        if i == 60 then kept = o
+
+    root_a = ptr_cast(kept)
+    root_b = null
+    collect(&h, &roots_ab)
+
+    // The first object sits at the block's base and the last against the bump pointer, which are
+    // the two ends an address-ordered walk can get wrong.
+    for i in 0..<COUNT
+        if i == 60
+            assert_eq(seen[i], 0, "the survivor is not finalized")
+        else
+            assert_eq(seen[i], 1, "every dead object is finalized, once, with its own payload")
+
+    collect(&h, &roots_ab)
+    for i in 0..<COUNT
+        val want = if i == 60 then 0 else 1
+        assert_eq(seen[i], want, "a second collection finalizes nothing that was already freed")
+    assert_eq(kept.tag, 60, "and the survivor's payload is untouched")
+end finalizer_once_per_dead_object
+
+@test("objects of several kinds die in one sweep, each finalized by its own kind or not at all")
+mixed_kinds_in_one_sweep()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+    clear_seen()
+    finalized = 0
+
+    var keep_rec: *Obj = null
+    var keep_chain: *Chain = null
+    val rounds: usize = 40
+
+    for i in 0..<rounds
+        val r = new_obj_of(&h, int(i), &recorded_kind)
+        val p = new_obj(&h, int(i))
+        val c = new_chain(&h, int(i))
+        val n = new_obj_of(&h, int(i), &counted_kind)
+        if i == 7
+            keep_rec = r
+            r.props[0] = ptr_cast(p)
+            r.props[1] = ptr_cast(n)
+        if i == 30 then keep_chain = c
+
+    root_a = ptr_cast(keep_rec)
+    root_b = ptr_cast(keep_chain)
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 4, "one of each kind survives")
+    assert_eq(finalized, 39, "every dead counted object ran its finalizer and no other kind ran it")
+    for i in 0..<rounds
+        val want = if i == 7 then 0 else 1
+        assert_eq(seen[i], want, "every dead recorded object ran its own finalizer once")
+
+    val plain: *Obj = ptr_cast(keep_rec.props[0])
+    val counted: *Obj = ptr_cast(keep_rec.props[1])
+    assert_eq(keep_rec.tag, 7)
+    assert_eq(plain.tag, 7)
+    assert_eq(counted.tag, 7)
+    assert_eq(keep_chain.step, 30)
+
+    // The object list was relinked from the survivors: teardown reaches each of them exactly once.
+    dispose(&h)
+    assert_eq(finalized, 40, "the surviving counted object is finalized at teardown")
+    assert_eq(seen[7], 1, "and so is the surviving recorded one, once")
+end mixed_kinds_in_one_sweep
+
+@test("the sweep hands every freed cell back to the allocator, and no cell twice")
+every_freed_cell_is_handed_out()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    // Every other object survives, so no two dead cells are neighbours and none is merged: each
+    // one comes back as the cell it was.
+    var head: *Obj = null
+    var dead: [COUNT]usize = [0; COUNT]
+    var taken: [COUNT]bool = [false; COUNT]
+    var n_dead: usize = 0
+
+    for i in 0..<COUNT
+        val o = new_obj(&h, int(i))
+        if i % 2 == 0
+            o.props[0] = ptr_cast(head)
+            head = o
+        else
+            dead[n_dead] = usize(o)
+            n_dead += 1
+
+    root_a = ptr_cast(head)
+    root_b = null
+    val grown = used(&h)
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), COUNT / 2)
+
+    for j in 0..<n_dead
+        val o = new_obj(&h, 1000)
+        assert_eq(used(&h), grown, "served from the free list, not the bump pointer")
+        var found = false
+        for k in 0..<n_dead
+            if dead[k] == usize(o)
+                assert(!taken[k], "a freed cell is handed out once")
+                taken[k] = true
+                found = true
+        assert(found, "what comes back is one of the cells that died")
+
+    val extra = new_obj(&h, 0)
+    assert(used(&h) > grown, "the free list held exactly the dead cells, and the next comes from the bump pointer")
+
+    var o = head
+    var survivors: usize = 0
+    while o != null
+        assert_eq(o.tag % 2, 0, "the survivors kept their payloads")
+        survivors += 1
+        o = ptr_cast(o.props[0])
+    assert_eq(survivors, COUNT / 2)
+end every_freed_cell_is_handed_out
+
+@test("a weak object that outlives a sweep of its neighbours is still found by the next weak pass")
+weak_survivor_stays_on_the_list()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536)
+
+    val target = new_obj(&h, 1)
+    for i in 0..<COUNT / 2
+        val o = new_obj(&h, int(i))
+    val w = new_weakref(&h, ptr_cast(target))
+    for i in 0..<COUNT / 2
+        val o = new_obj(&h, int(i))
+
+    val t: *u8 = ptr_cast(target)
+    root_a = ptr_cast(w)
+    root_b = t
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 2, "the reference and its target survive; everything between them died")
+    assert(w.target == t, "a live target is left alone")
+    assert_eq(weak_objects(&h), 1)
+
+    root_b = null
+    collect(&h, &roots_ab)
+    assert(w.target == null, "the reference was relinked onto the list, so the weak pass cleared it")
+    assert_eq(live(&h), 1)
+end weak_survivor_stays_on_the_list
 
 // -- Weak references ---------------------------------------------------------------------------
 

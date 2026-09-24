@@ -429,14 +429,15 @@ end hand_out
 
 // Rebuild every bin from the block itself, merging each run of adjacent free blocks into one.
 //
-// **This is why the sweep marks a dead object free instead of linking it into a bin as it goes.**
-// Two neighbours that die in the same collection are one block of twice the size, and nothing but
-// an address-ordered pass can see that: the object list is in allocation order, and a free list is
-// in whatever order things died. Walking the block from `base` to the bump pointer is the pass that
-// can, and it costs one step per block on a sweep that already costs one step per object.
+// **Merging is why the bins are rebuilt by walking the block rather than by pushing each block as it
+// dies.** Two neighbours that die in the same collection are one block of twice the size, and
+// nothing but an address-ordered pass can see that: the object list is in allocation order, and a
+// free list is in whatever order things died. Without it a heap of small objects could never satisfy
+// a large request again, however much it freed -- which is the failure that looks like a leak and is
+// not one.
 //
-// Without it a heap of small objects could never satisfy a large request again, however much it
-// freed -- which is the failure that looks like a leak and is not one.
+// `sweep` does this same walk with the freeing folded into it; this is what `dispose` uses, where
+// everything has already been freed.
 private rebuild_free(h: *Heap)
     for b in 0..<NBINS
         h.bins[b] = null
@@ -661,30 +662,68 @@ collect(h: *Heap, roots: Roots)
                 w.kind.weaken(payload_of(w), h)
             w = w.next
 
-    var prev: *Header = null
-    var p = h.all
-    while p != null
-        val nxt = p.next
-        if p.marked
-            p.marked = false
-            prev = p
-            p = nxt
-        else
-            if prev == null
-                h.all = nxt
-            else
-                prev.next = nxt
-            if p.kind.finalize != null
-                p.kind.finalize(payload_of(p))
-            if p.kind.weaken != null then h.weakeners -= 1
-            if p.kind.ephemeron != null then h.ephemerals -= 1
-            p.free = true
-            h.live -= 1
-            h.live_bytes -= p.size
-            p = nxt
-
-    rebuild_free(h)
+    sweep(h)
 end collect
+
+// Free every object marking did not reach, rebuild the object list from the survivors, and rebuild
+// every bin with neighbouring free blocks merged -- all in ONE walk of the block, in address order.
+//
+// **This used to be two walks, and the first was the expensive one.** The sweep followed the object
+// list, which is in allocation order and, once storage is being reused, in no order the memory
+// system can predict: every step was a dependent load from wherever the next object happened to be.
+// Then `rebuild_free` walked the block from `base` to the bump pointer anyway, because merging
+// neighbours needs address order. That second walk already visits every object's header, so it can
+// do the sweep's work as it passes -- and the object list, which nothing reads for its order, is
+// relinked from the survivors in the order they are met. What is left per block is one sequential
+// read of a header that the next one sits directly after.
+//
+// Per dead object that is a size, a mark bit, a kind pointer and the kind's `finalize` -- and a
+// call only where that is not null. The weak counts are read off the kind only while a weak object
+// is live at all, which is `Heap.weakeners`'s reason again.
+private sweep(h: *Heap)
+    for b in 0..<NBINS
+        h.bins[b] = null
+
+    h.mask_lo = 0u64
+    h.mask_hi = 0u64
+
+    val counted = h.weakeners > 0 || h.ephemerals > 0
+    var tail: *Header = null
+    var off: usize = 0
+    var start: usize = 0
+    var run: usize = 0
+
+    h.all = null
+
+    while off < h.bump
+        var o: *Header = ptr_cast(usize(h.base) + off)
+        val sz = o.size
+
+        if !o.free && o.marked
+            o.marked = false
+            if tail == null then h.all = o else tail.next = o
+            tail = o
+            if run > 0
+                close_run(h, start, run)
+                run = 0
+        else
+            if !o.free
+                val k = o.kind
+                if k.finalize != null then k.finalize(payload_of(o))
+                if counted
+                    if k.weaken != null then h.weakeners -= 1
+                    if k.ephemeron != null then h.ephemerals -= 1
+                o.free = true
+                h.live -= 1
+                h.live_bytes -= sz
+            if run == 0 then start = off
+            run += sz
+
+        off += sz
+
+    if tail != null then tail.next = null
+    if run > 0 then close_run(h, start, run)
+end sweep
 
 // Finalize and free every object, live or not, leaving an empty heap over the same block.
 //
