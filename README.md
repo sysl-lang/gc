@@ -49,9 +49,15 @@ that is what a client may rely on when it stores anything reference counted. (`a
 the one entry point that does not, and everything in this section is what it hands to the caller.)
 
 **A reference-counted value is fine, and its finaliser is how it is given back.** A `string`, a `Buf`
-and a `Map` all work: store one in, release it by writing an empty one in `finalize`. That is what
-lets a language's string be collected — the object is the sysl string's only owner, and finalising
-takes its count to zero — without this package reimplementing string handling over raw blocks.
+and a `Map` all work: store one in, and release it in `finalize`. That is what lets a language's
+string be collected — the object is the sysl string's only owner, and finalising takes its count to
+zero — without this package reimplementing string handling over raw blocks.
+
+**Release a `Buf` or a `Map` with `.release()`, never by writing an empty one.** A `Buf` and a `Map`
+are references to a core, so `x = buf()` or `x = map()` releases the old core and then *allocates* a
+new, empty one into the payload. Nothing ever releases that one: the next `alloc` of the block zeroes
+it. That is one leaked core per swept object. `x.release()` gives the core back and leaves nothing
+behind. A `string` may be emptied with `x = ""`, because a literal is never allocated.
 
 **The zeroing is what makes that true, and until 0.2.1 it was not done.** Assigning a `string`, a
 `Buf` or a `Map` in sysl *releases the previous occupant*, so the client's first write into a payload
