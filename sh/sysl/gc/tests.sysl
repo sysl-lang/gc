@@ -1,6 +1,8 @@
 module sh.sysl.gc
 @tests
 
+import sysl.raw.ptr_cast
+
 // What this collector claims, run by `sysl test .`.
 //
 // The client here is a miniature of the thing the package exists for: object kinds with different

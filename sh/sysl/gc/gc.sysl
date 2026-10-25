@@ -3,6 +3,7 @@ module sh.sysl.gc
 // For `trailing_zeros`, which is the bit scan the free-list mask is read with. A trait of the
 // language's own numbers rather than a capability: `requires {}` below stays exact.
 import sysl.math.Bits
+import sysl.raw.ptr_cast
 
 // A tracing garbage collector over storage the caller supplies.
 //
