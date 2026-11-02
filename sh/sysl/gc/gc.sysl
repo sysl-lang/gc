@@ -505,7 +505,7 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 heap(base: *u8, cap: usize) -> Heap
     val lead = (GRAIN - (usize(base) + sizeof(Header)) % GRAIN) % GRAIN
     val room = if cap > lead then cap - lead else 0
-    Heap(ptr_cast(usize(base) + lead), room, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
+    Heap(&base[lead], room, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
 //

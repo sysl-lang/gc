@@ -1,0 +1,15 @@
+// A heap over a local array may not outlive that array: the borrow checker must still follow the
+// address that `heap` hands to the `Heap`, through the offset that aligns it.
+// error: outlive the call
+// error: a local of 'boot'
+import sh.sysl.gc
+
+private noop(p: *u8, h: *gc.Heap)
+    return
+
+private var kind: gc.Kind = gc.Kind(&noop, null, null, null)
+
+boot() -> int
+    var block: [4096 + 16]u8 = [255u8; 4096 + 16]
+    var h = gc.heap(&block[0], 4096)
+    if gc.alloc(&h, 8, &kind) == null then 1 else 0
