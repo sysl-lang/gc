@@ -501,10 +501,13 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // first byte, so if the first header sits where its payload lands on a 16-byte boundary, every
 // header does. The arena is entered `lead` bytes in to make that so, and `lead` is less than 16.
 // Those bytes come out of `cap`; an arena no bigger than `lead` holds nothing and refuses every
-// allocation.
+// allocation. A `cap` within a header and a grain of the whole `usize` range is cut to that, which
+// is what lets `take` refuse an oversized request with a single compare and no risk of wrap.
 heap(base: *u8, cap: usize) -> Heap
     val lead = (GRAIN - (usize(base) + sizeof(Header)) % GRAIN) % GRAIN
-    val room = if cap > lead then cap - lead else 0
+    val most = ~0usize - sizeof(Header) - (GRAIN - 1)
+    val left = if cap > lead then cap - lead else 0
+    val room = if left > most then most else left
     Heap(&base[lead], room, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
@@ -556,11 +559,15 @@ private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
     // a grain both wrap for a size near the top of the `usize` range, and a wrapped value is a small
     // block that would be handed out against a huge length. A size too large to round is refused
     // here, and so is a block longer than the whole arena, which no free list could hold either.
-    if size > ~0usize - (GRAIN - 1) - sizeof(Header) then return null
+    //
+    // **One compare does both jobs.** `heap` keeps `cap` at or below `~0usize` less a header and a
+    // grain's rounding, so a size not above `cap` cannot wrap when the header is added and the sum
+    // rounded up, on a word of any width. A request
+    // the rounding pushes past `cap` is refused later without a test of its own: every free block is
+    // at most `cap` long, so none is big enough, and the bump check below fails for it.
+    if size > h.cap then return null
 
     val need = align_up(size + sizeof(Header))
-
-    if need > h.cap then return null
 
     val want = bin_of(need)
 

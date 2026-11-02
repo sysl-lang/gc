@@ -1691,6 +1691,29 @@ alloc_refuses_larger_than_arena()
     assert(refused(&h, &block[0], 4096, 1048576), "a megabyte")
 end alloc_refuses_larger_than_arena
 
+@test("an arena claimed to span the whole address space is cut so no request can wrap")
+alloc_refuses_wrapping_sizes_on_a_huge_claimed_arena()
+    var block = dirty(4096)
+    var h = heap(&block[0], ~0usize)
+
+    // A zero-byte block is a header rounded up to a grain, so the header is more than a grain
+    // exactly when that is more than one.
+    var probe = dirty(4096)
+    var p = heap(&probe[0], 4096)
+
+    assert(alloc_raw(&p, 0, &obj_kind) != null)
+    assert(used(&p) > GRAIN, "a header is longer than a grain")
+
+    // Every size from `used(&p) + 14` below the top of the range up to the top. The cut sits a
+    // header and `GRAIN - 1` below the top, so these are the sizes that wrap `size + header + grain
+    // - 1` to a small block, plus the ones not above the cut whose block rounds past it.
+    val low = ~0usize - used(&p) - 14
+
+    for j in 0..<(used(&p) + 15)
+        assert(refused(&h, &block[0], 4096, low + j), "from the cut to the top")
+    assert(alloc_raw(&h, 64, &obj_kind) != null, "a small request is still served")
+end alloc_refuses_wrapping_sizes_on_a_huge_claimed_arena
+
 @test("a refusal changes no state: the next allocation behaves as on a fresh heap")
 refusal_leaves_heap_as_fresh()
     var b1 = dirty(4096)
