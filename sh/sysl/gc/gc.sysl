@@ -543,7 +543,16 @@ alloc_raw(h: *Heap, size: usize, kind: *Kind) -> *u8 = take(h, size, kind, false
 // The body both entry points share. `clear` is a constant at each of the two call sites, so the
 // branch in `hand_out` is folded away rather than tested per allocation.
 private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
+    // **A request is validated before anything is touched.** `size + header` and its rounding up to
+    // a grain both wrap for a size near the top of the `usize` range, and a wrapped value is a small
+    // block that would be handed out against a huge length. A size too large to round is refused
+    // here, and so is a block longer than the whole arena, which no free list could hold either.
+    if size > ~0usize - (GRAIN - 1) - sizeof(Header) then return null
+
     val need = align_up(size + sizeof(Header))
+
+    if need > h.cap then return null
+
     val want = bin_of(need)
 
     // **What an allocation costs, which is the whole reason the bins are here.** A request is served
@@ -566,7 +575,7 @@ private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
         split(h, f, need)
         return hand_out(h, f, kind, size, clear)
 
-    if h.bump + need <= h.cap
+    if need <= h.cap - h.bump
         var o: *Header = ptr_cast(usize(h.base) + h.bump)
 
         h.bump += need

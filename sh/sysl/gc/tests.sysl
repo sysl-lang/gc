@@ -1594,3 +1594,153 @@ raw_objects_leak_nothing()
 
     assert_eq(round, 4, "four rounds out of storage that only ever held one")
 end raw_objects_leak_nothing
+
+// Requests too large to satisfy. Each refusal must answer null, leave every counter, every bin and
+// every free list as it was, and never touch a payload byte.
+
+private struct Snap
+    live: usize
+    live_bytes: usize
+    used: usize
+    steps: usize
+    binned: usize
+    first_free: usize
+
+private snap(h: *Heap) -> Snap
+    var binned: usize = 0
+    var first_free: usize = 0
+
+    for b in 0..<NBINS
+        binned += bin_length(h, b) * (b + 1)
+        if first_free == 0 && !bin_empty(h, b) then first_free = b + 1
+
+    Snap(live(h), live_size(h), used(h), alloc_steps(h), binned, first_free)
+
+private same(a: Snap, b: Snap) -> bool
+    a.live == b.live && a.live_bytes == b.live_bytes && a.used == b.used && a.steps == b.steps && a.binned == b.binned && a.first_free == b.first_free
+
+// Whether both entry points refuse `size`, with the heap's state and the arena's bytes untouched.
+private refused(h: *Heap, arena: *u8, len: usize, size: usize) -> bool
+    val before = snap(h)
+    val a = alloc(h, size, &obj_kind)
+    val r = alloc_raw(h, size, &obj_kind)
+    var intact = true
+
+    for i in 0..<len
+        if arena[i] != 255 && i >= used(h) then intact = false
+
+    a == null && r == null && same(before, snap(h)) && intact
+
+// The largest payload a fresh heap of `cap` bytes can hand out, found by asking.
+private largest(cap: usize) -> usize
+    var block = dirty(cap)
+    var h = heap(&block[0], cap)
+    var n = cap
+
+    loop
+        if alloc_raw(&h, n, &obj_kind) != null then return n
+        if n == 0 then return 0
+        n -= 1
+    0
+
+@test("a request of the largest usize is refused, not wrapped into a small block")
+alloc_refuses_max_usize()
+    var block = dirty(4096)
+    var h = heap(&block[0], 4096)
+
+    assert(alloc_raw(&h, ~0usize, &obj_kind) == null, "alloc_raw")
+    assert(alloc(&h, ~0usize, &obj_kind) == null, "alloc")
+    assert_eq(used(&h), 0, "nothing was carved")
+    assert_eq(live(&h), 0, "nothing was counted")
+end alloc_refuses_max_usize
+
+@test("the exact boundary of the arena: the largest request fits and one more byte does not")
+alloc_boundary_is_exact()
+    val top = largest(4096)
+
+    assert(top > 4000 && top < 4096, "the largest payload is the arena less one header")
+
+    var block = dirty(4096)
+    var h = heap(&block[0], 4096)
+
+    assert(refused(&h, &block[0], 4096, top + 1), "one byte over")
+    assert(refused(&h, &block[0], 4096, top + 16), "a grain over")
+    assert(alloc_raw(&h, top, &obj_kind) != null, "and the largest still fits after the refusals")
+    assert_eq(live(&h), 1)
+end alloc_boundary_is_exact
+
+@test("a size whose rounding alone overflows is refused")
+alloc_refuses_sizes_that_wrap_when_rounded()
+    var block = dirty(4096)
+    var h = heap(&block[0], 4096)
+
+    for k in 0..<64
+        assert(refused(&h, &block[0], 4096, ~0usize - usize(k)), "~0 minus a small k")
+
+    assert(refused(&h, &block[0], 4096, ~0usize / 2), "half the address space")
+    assert(refused(&h, &block[0], 4096, ~0usize / 2 + 1), "the sign bit")
+end alloc_refuses_sizes_that_wrap_when_rounded
+
+@test("a size that fits arithmetically but exceeds the arena is refused")
+alloc_refuses_larger_than_arena()
+    var block = dirty(4096)
+    var h = heap(&block[0], 4096)
+
+    assert(refused(&h, &block[0], 4096, 4096), "the arena itself")
+    assert(refused(&h, &block[0], 4096, 8192), "twice the arena")
+    assert(refused(&h, &block[0], 4096, 1048576), "a megabyte")
+end alloc_refuses_larger_than_arena
+
+@test("a refusal changes no state: the next allocation behaves as on a fresh heap")
+refusal_leaves_heap_as_fresh()
+    var b1 = dirty(4096)
+    var b2 = dirty(4096)
+    var fresh_heap = heap(&b1[0], 4096)
+    var refused_heap = heap(&b2[0], 4096)
+
+    assert(refused(&refused_heap, &b2[0], 4096, ~0usize), "~0")
+    assert(refused(&refused_heap, &b2[0], 4096, ~0usize - 7), "~0 - 7")
+    assert(refused(&refused_heap, &b2[0], 4096, 5000), "over the arena")
+
+    val p = alloc(&fresh_heap, 100, &obj_kind)
+    val q = alloc(&refused_heap, 100, &obj_kind)
+
+    assert(p != null && q != null, "both allocate")
+    assert_eq(usize(q) - usize(&b2[0]), usize(p) - usize(&b1[0]), "at the same offset")
+    assert(same(snap(&fresh_heap), snap(&refused_heap)), "with the same counters")
+end refusal_leaves_heap_as_fresh
+
+@test("alloc zeroes nothing and writes no length when it refuses")
+alloc_refusal_does_not_touch_memory()
+    var block = dirty(4096)
+    var h = heap(&block[0], 4096)
+
+    assert(alloc(&h, ~0usize, &obj_kind) == null)
+    assert(alloc(&h, ~0usize - 15, &obj_kind) == null)
+
+    for i in 0..<4096
+        assert_eq(block[i], 255, "arena byte")
+end alloc_refusal_does_not_touch_memory
+
+@test("a refusal after blocks were freed, split and coalesced still changes nothing")
+refusal_after_free_split_coalesce()
+    var block = dirty(16384)
+    var h = heap(&block[0], 16384)
+
+    for i in 0..<40
+        assert(alloc(&h, 16 + usize(i % 7) * 40, &obj_kind) != null)
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0, "everything swept and coalesced")
+
+    val small = alloc(&h, 24, &obj_kind)
+
+    assert(small != null, "a free block is split")
+    assert(refused(&h, &block[0], 0, ~0usize), "~0")
+    assert(refused(&h, &block[0], 0, ~0usize - 3), "~0 - 3")
+    assert(refused(&h, &block[0], 0, 16385), "over the arena")
+    assert_eq(live(&h), 1)
+    assert(alloc(&h, 200, &obj_kind) != null, "and the heap still serves")
+end refusal_after_free_split_coalesce
