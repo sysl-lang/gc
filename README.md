@@ -42,6 +42,12 @@ The collector never learns what `Obj` is. Every object points at the `Kind` its 
 the same type erasure sysl's own ARC uses to put a destructor behind a hook: one code path, no static
 type, a heap that may hold anything.
 
+**Payloads are 16-byte aligned whatever `base` is.** `heap` enters the block up to 15 bytes in, so
+that the first payload lands on a 16-byte boundary, and every block after it is a multiple of the
+16-byte grain. Up to 15 bytes of `cap` are given up to that. A block no bigger than the bytes given
+up holds nothing, and every `alloc` on it answers `null`. A client may therefore keep a `u128`, a
+SIMD vector or any 16-aligned type in a payload.
+
 ## What a collected object may hold
 
 An object's payload is **zeroed by `alloc`**, on the free-list path as well as the bump path, and

@@ -496,7 +496,16 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // A heap over `cap` bytes at `base`. The block must outlive the heap and must not be touched by
 // anything else; a hosted program usually `malloc`s it once at startup, and a freestanding one
 // points at a static array.
-heap(base: *u8, cap: usize) -> Heap = Heap(base, cap, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
+//
+// **Every payload is 16-byte aligned.** Blocks are multiples of `GRAIN` and tile the arena from its
+// first byte, so if the first header sits where its payload lands on a 16-byte boundary, every
+// header does. The arena is entered `lead` bytes in to make that so, and `lead` is less than 16.
+// Those bytes come out of `cap`; an arena no bigger than `lead` holds nothing and refuses every
+// allocation.
+heap(base: *u8, cap: usize) -> Heap
+    val lead = (GRAIN - (usize(base) + sizeof(Header)) % GRAIN) % GRAIN
+    val room = if cap > lead then cap - lead else 0
+    Heap(ptr_cast(usize(base) + lead), room, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
 //

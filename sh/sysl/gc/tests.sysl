@@ -1744,3 +1744,274 @@ refusal_after_free_split_coalesce()
     assert_eq(live(&h), 1)
     assert(alloc(&h, 200, &obj_kind) != null, "and the heap still serves")
 end refusal_after_free_split_coalesce
+
+// Payload alignment. `heap` enters the arena up to 15 bytes in so that every payload lands on a
+// 16-byte boundary whatever address the arena starts at; these tests slide the arena through every
+// offset 0..15 of a buffer, which covers every residue of the start address modulo 16.
+
+private aligned(p: *u8) -> bool = p != null && usize(p) % 16 == 0
+
+// Whether `p` and its `size` payload bytes lie inside the `cap` bytes at `base`.
+private inside(p: *u8, size: usize, base: *u8, cap: usize) -> bool
+    usize(p) >= usize(base) && usize(p) + size <= usize(base) + cap
+
+// The largest payload a fresh heap of `cap` bytes at offset `shift` of a block can hand out.
+private largest_from(shift: usize, cap: usize) -> usize
+    var block = dirty(cap + 16)
+    var h = heap(&block[shift], cap)
+    var n = cap
+
+    loop
+        if alloc_raw(&h, n, &obj_kind) != null then return n
+        if n == 0 then return 0
+        n -= 1
+    0
+
+@test("fresh blocks are 16-byte aligned at every arena offset")
+payloads_fresh_are_16_aligned()
+    var block = dirty(16384 + 16)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 16384)
+
+        for i in 0..<40
+            val size = 1 + usize(i) * 13 % 300
+            val p = alloc(&h, size, &obj_kind)
+            assert(aligned(p), "a fresh block off the bump pointer")
+            assert(inside(p, size, &block[shift], 16384), "and it is inside the arena")
+
+            val q = alloc_raw(&h, size, &obj_kind)
+            assert(aligned(q), "alloc_raw too")
+end payloads_fresh_are_16_aligned
+
+@test("blocks split from a coalesced run are 16-byte aligned at every arena offset")
+payloads_split_from_coalesced_are_16_aligned()
+    var block = dirty(16384 + 16)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 16384)
+
+        for i in 0..<40
+            assert(alloc(&h, 1 + usize(i) * 13 % 300, &obj_kind) != null)
+
+        root_a = null
+        root_b = null
+        collect(&h, &roots_ab)
+        assert_eq(live(&h), 0, "everything swept and coalesced")
+
+        for i in 0..<40
+            val p = alloc(&h, 1 + usize(i) * 29 % 500, &obj_kind)
+            assert(aligned(p), "a block split out of a coalesced run")
+            assert(inside(p, 1, &block[shift], 16384))
+end payloads_split_from_coalesced_are_16_aligned
+
+@test("blocks split from a freed larger block are 16-byte aligned at every arena offset")
+payloads_split_from_free_block_are_16_aligned()
+    var block = dirty(16384 + 16)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 16384)
+
+        assert(alloc(&h, 3000, &obj_kind) != null)
+        root_a = null
+        root_b = null
+        collect(&h, &roots_ab)
+
+        for i in 0..<20
+            assert(aligned(alloc(&h, 8 + usize(i) * 7, &obj_kind)), "a small block carved from the large free one")
+end payloads_split_from_free_block_are_16_aligned
+
+@test("blocks reused from their exact class are 16-byte aligned at every arena offset")
+payloads_reused_from_exact_class_are_16_aligned()
+    var block = fresh(16384 + 16)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 16384)
+        var prev: *Obj = null
+
+        // Dead and live objects alternate, so each dead one is a hole between live neighbours that
+        // coalescing cannot widen, and the next request of its size takes it from its own class.
+        for i in 0..<20
+            new_obj(&h, 0)
+            val live_one = new_obj(&h, 1)
+            live_one.props[0] = ptr_cast(prev)
+            prev = live_one
+
+        root_a = ptr_cast(prev)
+        root_b = null
+        collect(&h, &roots_ab)
+        assert_eq(live(&h), 20, "the live half survives")
+
+        val top = used(&h)
+
+        for i in 0..<20
+            val p = alloc_raw(&h, sizeof(Obj), &obj_kind)
+            assert(aligned(p), "a hole reused from its exact class")
+            assert(inside(p, sizeof(Obj), &block[shift], 16384))
+
+        assert_eq(used(&h), top, "all twenty came out of the holes, none off the bump pointer")
+end payloads_reused_from_exact_class_are_16_aligned
+
+@test("an arena too small for one block refuses cleanly at every offset")
+tiny_arenas_refuse_cleanly()
+    for cap in 0..<65
+        var block = dirty(cap + 48)
+
+        for shift in 0..<16
+            var h = heap(&block[shift], cap)
+            val p = alloc(&h, 1, &obj_kind)
+
+            if cap < 16
+                assert(p == null, "no room for a header")
+
+            if p != null
+                assert(aligned(p), "a block that does fit is aligned")
+                assert(inside(p, 1, &block[shift], cap), "and is inside the arena")
+            else
+                assert_eq(used(&h), 0, "a refusal carves nothing")
+                assert_eq(live(&h), 0)
+
+            assert(alloc_raw(&h, ~0usize, &obj_kind) == null, "the largest request is refused")
+
+            for i in 0..<48
+                if i >= cap + shift then assert_eq(block[i], 255, "no byte past the arena is written")
+end tiny_arenas_refuse_cleanly
+
+@test("an arena no longer than its lead holds nothing")
+arena_shorter_than_lead_holds_nothing()
+    var block = dirty(64)
+
+    for shift in 0..<16
+        for cap in 0..<16
+            var h = heap(&block[shift], cap)
+            assert(alloc(&h, 1, &obj_kind) == null, "alloc")
+            assert(alloc_raw(&h, 0, &obj_kind) == null, "alloc_raw")
+            assert_eq(used(&h), 0)
+            assert_eq(live_size(&h), 0)
+end arena_shorter_than_lead_holds_nothing
+
+@test("the largest satisfiable request at each offset fits, one more byte is refused, and nothing past the arena is written")
+largest_request_at_every_offset()
+    var best: usize = 0
+
+    for shift in 0..<16
+        val top = largest_from(shift, 4096)
+        if top > best then best = top
+
+    for shift in 0..<16
+        val top = largest_from(shift, 4096)
+
+        assert(best - top <= 16, "the lead costs at most one grain of payload")
+
+        var block = dirty(4096 + 16 + 32)
+        var h = heap(&block[shift], 4096)
+
+        assert(refused(&h, &block[shift], 4096, top + 1), "one byte over")
+        assert(refused(&h, &block[shift], 4096, top + 16), "a grain over")
+        assert(refused(&h, &block[shift], 4096, ~0usize - 3), "a size that wraps when rounded")
+
+        val p = alloc(&h, top, &obj_kind)
+        assert(aligned(p), "the largest payload is aligned")
+        assert(inside(p, top, &block[shift], 4096), "and ends inside the arena")
+
+        for i in 0..<32
+            assert_eq(block[shift + 4096 + i], 255, "the guard bytes after the arena are untouched")
+end largest_request_at_every_offset
+
+@test("the counters do not depend on the arena offset")
+counters_ignore_the_lead()
+    var block = fresh(16384 + 16)
+    var first: Snap = Snap(0, 0, 0, 0, 0, 0)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 16384)
+
+        for i in 0..<30
+            assert(alloc(&h, 1 + usize(i) * 13 % 300, &obj_kind) != null)
+
+        root_a = null
+        root_b = null
+        collect(&h, &roots_ab)
+
+        for i in 0..<30
+            assert(alloc(&h, 1 + usize(i) * 29 % 200, &obj_kind) != null)
+
+        val s = snap(&h)
+
+        if shift == 0 then first = s
+        assert(same(first, s), "live, live_size, used, steps and the free lists agree with offset 0")
+end counters_ignore_the_lead
+
+@test("dispose over an offset arena finalizes everything and leaves it reusable and aligned")
+dispose_over_offset_arena()
+    var block = fresh(65536 + 16)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 65536)
+        finalized = 0
+
+        val a = new_obj_of(&h, 1, &counted_kind)
+        val b = new_obj_of(&h, 2, &counted_kind)
+        a.props[0] = ptr_cast(b)
+        assert(aligned(ptr_cast(a)) && aligned(ptr_cast(b)))
+
+        root_a = ptr_cast(a)
+        root_b = null
+        collect(&h, &roots_ab)
+        assert_eq(finalized, 0, "both reachable")
+
+        dispose(&h)
+        assert_eq(finalized, 2, "teardown runs every finalizer")
+        assert_eq(live(&h), 0)
+        assert_eq(live_size(&h), 0)
+
+        for i in 0..<10
+            assert(aligned(alloc(&h, 1 + usize(i) * 17, &obj_kind)), "and the disposed heap still hands out aligned blocks")
+end dispose_over_offset_arena
+
+@test("an ephemeron keeps its value alive through its key over an offset arena")
+ephemeron_over_offset_arena()
+    var block = fresh(65536 + 16)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 65536)
+
+        val m = new_weakmap(&h)
+        val key = new_obj(&h, 1)
+        val value = new_obj(&h, 2)
+        m.keys[0] = ptr_cast(key)
+        m.vals[0] = ptr_cast(value)
+        assert(aligned(ptr_cast(m)) && aligned(ptr_cast(key)) && aligned(ptr_cast(value)))
+
+        root_a = ptr_cast(m)
+        root_b = ptr_cast(key)
+        collect(&h, &roots_ab)
+        assert_eq(live(&h), 3, "map, key and value survive")
+        assert_eq(ptr_cast[*Obj](m.vals[0]).tag, 2, "and the value is intact")
+
+        root_b = null
+        collect(&h, &roots_ab)
+        assert_eq(live(&h), 1, "the key died, and the entry and its value with it")
+        assert(m.keys[0] == null && m.vals[0] == null)
+end ephemeron_over_offset_arena
+
+@test("a weak reference is cleared over an offset arena")
+weakref_over_offset_arena()
+    var block = fresh(65536 + 16)
+
+    for shift in 0..<16
+        var h = heap(&block[shift], 65536)
+
+        val target = new_obj(&h, 1)
+        val w = new_weakref(&h, ptr_cast(target))
+        assert(aligned(ptr_cast(w)))
+
+        root_a = ptr_cast(w)
+        root_b = ptr_cast(target)
+        collect(&h, &roots_ab)
+        assert(w.target != null, "kept while the target is live")
+
+        root_b = null
+        collect(&h, &roots_ab)
+        assert(w.target == null, "cleared once the target is dead")
+end weakref_over_offset_arena
