@@ -381,11 +381,14 @@ changes address, so a client may hold a raw `*T` to a collected object anywhere 
 struct, across a call — with no handle table and without telling the collector. A copying collector
 buys locality and pays for it by making every one of those illegal.
 
-**Every object costs a four-word header**: 32 bytes on a 64-bit target, 16 on a 32-bit one — the
-object-list link, the worklist link, the `*Kind`, and one word holding the block's length with the
-mark and free flags in its low bits. A block is the payload plus the header, rounded up to 16 bytes,
-so an 8- or 16-byte payload takes 48 bytes and a 32-byte payload 64. The header is private apart from
-`KIND_BACK`: the kind and the length word are the last two words before the payload in every layout.
+**Every object costs a three-word header**: 24 bytes on a 64-bit target, 12 on a 32-bit one — one
+link (a free block's bin link, or a marked object's worklist link; never both at once), the `*Kind`,
+and one word holding the block's length with the mark and free flags in its low bits. A block is the
+payload plus the header, rounded up to 16 bytes, so an 8-byte payload takes 32 bytes, a 16- or
+24-byte payload 48 and a 32-byte payload 64. There is no list of every object: the passes that visit
+them all — the weak passes, the sweep, `dispose` — walk the arena in address order. The header is
+private apart from `KIND_BACK`: the kind and the length word are the last two words before the
+payload in every layout.
 
 **The mark phase is a loop, not a recursion.** A worklist threaded through the object headers means a
 list a million long and a tree a million deep both cost O(1) stack. That is not an optimization: a
@@ -489,9 +492,8 @@ interface.
 - **`mark` ignores pointers outside the arena, and `is_live` answers `true` for them** (still
   `false` for `null`). A client that only ever marks `null` and its own heap objects sees no
   difference; one that guarded `mark` with its own range test can drop it.
-- **Every object is 16 bytes smaller** where its payload is a multiple of 16 or more than 8 bytes past
-  one: the header is four words instead of five. Nothing about the header is visible except
-  `KIND_BACK`.
+- **Objects are smaller**: the header is three words instead of five, so most objects take 16 bytes
+  less and an 8-byte one 32 less. Nothing about the header is visible except `KIND_BACK`.
 - **New, and needing no change:** `context`, `kind_of`, `KIND_BACK`, the `checks` option and
   `foreign_marks`. A client that kept a descriptor pointer in its payload's first word can move it
   into a `Kind`-first descriptor and read it with `kind_of`, which saves the word in every object.
@@ -545,7 +547,7 @@ So are the header and the range test. With `mark` pushing an object whatever its
 traced-once tests fail (a self-cycle, a node with two parents, an ephemeron's re-mark); with the range
 test reduced to a `null` check, the constant, the weak-reference-to-a-constant, the arena-edge and the
 `foreign_marks` tests fail; and with the range measured from the payload rather than the header, the
-arena's base is taken for an object and a zero-byte object at the top is not. Each `checks` trap
+arena's base is taken for an object. Each `checks` trap
 test fails with the check it exercises removed, except the `null`-kind one: an allocation naming no
 kind stops on the null load without the check too, and the check only moves the stop to before any
 heap state has changed.

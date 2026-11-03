@@ -2301,17 +2301,21 @@ checks_pass_a_well_formed_heap()
 
 // -- The four-word header -------------------------------------------------------------------------
 
-@test("a header is four words, so a zero-byte object costs exactly that")
-header_is_four_words()
+@test("a header is three words, so a zero-byte object costs that rounded to a grain")
+header_is_three_words()
     var block = fresh(4096)
     var h = heap(&block[0], 4096, null)
+    val words = 3 * sizeof(usize)
+    val zero = (words + GRAIN - 1) / GRAIN * GRAIN
 
     val p = alloc(&h, 0, &obj_kind)
-    assert_eq(used(&h), 4 * sizeof(usize), "one header and nothing else")
-    assert_eq(block_bytes(p), 4 * sizeof(usize))
-    assert_eq(block_length(0), 4 * sizeof(usize))
-    assert_eq(block_length(16), 4 * sizeof(usize) + 16, "a 16-byte payload adds one grain")
-    assert_eq(block_length(17), 4 * sizeof(usize) + 32)
+    assert_eq(used(&h), zero, "one header, rounded, and nothing else")
+    assert_eq(block_bytes(p), zero)
+    assert_eq(block_length(0), zero)
+    assert_eq(block_length(zero - words), zero, "a payload that fills the header's last grain costs nothing more")
+    assert_eq(block_length(8), 32, "an 8-byte payload, a box, is two grains on any target")
+    assert_eq(block_length(16), (words + 16 + GRAIN - 1) / GRAIN * GRAIN)
+    assert(usize(p) % GRAIN == 0, "and the payload is still 16-byte aligned")
 
 // A kind with nothing to trace, for payloads of any length -- including ones too short to be an Obj.
 private var leaf_kind: Kind = Kind(&trace_nothing, null, null, null)
@@ -2357,7 +2361,7 @@ end header_word_round_trips
 largest_block_round_trips()
     var block = fresh(4096)
     var h = heap(&block[0], 4096, null)
-    val top = (arena_room(&h) & ~(GRAIN - 1)) - block_length(0)
+    val top = (arena_room(&h) & ~(GRAIN - 1)) - header_bytes()
 
     assert(alloc(&h, top + 1, &obj_kind) == null, "a byte more than the largest does not fit")
     val p = alloc(&h, top, &obj_kind)
@@ -2568,14 +2572,14 @@ mark_ignores_addresses_at_the_arena_edges()
     root_a = null
 end mark_ignores_addresses_at_the_arena_edges
 
-@test("a zero-byte object at the top of the used part is marked: its payload is the used part's end")
+@test("a zero-byte object at the top of the used part is marked: its payload is a header into its block")
 zero_byte_object_at_the_top_is_in_range()
     var block = fresh(4096)
     var h = heap(&block[0], 4096, null)
     new_obj(&h, 1)
     val z = alloc(&h, 0, &leaf_kind)
 
-    assert(z == &arena_base(&h)[used(&h)], "its payload is one past the last used byte")
+    assert(z == &arena_base(&h)[used(&h) - block_length(0) + header_bytes()], "the last block's payload")
     root_a = z
     collect(&h, &roots_ab)
     assert_eq(live(&h), 1, "it survives, so mark took it as an object")
