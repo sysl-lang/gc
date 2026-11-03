@@ -2,6 +2,7 @@ module sh.sysl.gc
 @tests
 
 import sysl.raw.ptr_cast
+import sysl.testing.skip
 
 // What this collector claims, run by `sysl test .`.
 //
@@ -47,8 +48,12 @@ private trace_nothing(p: *u8, h: *Heap)
 
 private var finalized: int = 0
 
-private count_finalize(p: *u8)
+// Which heap the last finalizer call was handed, so a test can tell it is the one being swept.
+private var finalized_on: *Heap = null
+
+private count_finalize(p: *u8, h: *Heap)
     finalized += 1
+    finalized_on = h
 
 private weaken_weakref(p: *u8, h: *Heap)
     var w: *WeakRef = ptr_cast(p)
@@ -80,7 +85,7 @@ private ephemeron_weakmap(p: *u8, h: *Heap) -> bool
 private const COUNT: usize = 120
 private var seen: [COUNT]int = [0; COUNT]
 
-private record_finalize(p: *u8)
+private record_finalize(p: *u8, h: *Heap)
     val o: *Obj = ptr_cast(p)
     seen[usize(o.tag)] += 1
 
@@ -149,7 +154,7 @@ private fresh(bytes: usize) -> []u8 = [0; bytes]
 @test("an unreachable cycle is collected, which is the whole reason to trace")
 cycle_is_collected()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val keep = new_obj(&h, 1)
     val a = new_obj(&h, 2)
@@ -170,7 +175,7 @@ end cycle_is_collected
 @test("everything reachable from a root survives, however it is reached")
 reachable_survives()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val a = new_obj(&h, 1)
     val b = new_obj(&h, 2)
@@ -192,7 +197,7 @@ end reachable_survives
 @test("a chain deeper than any stack marks iteratively")
 deep_chain_costs_no_stack()
     var block = fresh(4194304)
-    var h = heap(&block[0], 4194304)
+    var h = heap(&block[0], 4194304, null)
 
     // Deep enough that a recursive mark phase would overflow before it finished.
     val depth = 20000
@@ -217,7 +222,7 @@ end deep_chain_costs_no_stack
 @test("swept storage is reused instead of growing the block")
 storage_is_reused()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     var i = 0
     while i < 100
@@ -244,7 +249,7 @@ end storage_is_reused
 @test("live_size rises with allocation and falls with a sweep, where used only ever rises")
 live_size_is_the_one_to_schedule_by()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     assert_eq(live_size(&h), 0)
 
@@ -272,7 +277,7 @@ end live_size_is_the_one_to_schedule_by
 @test("live_size counts what a reused block costs, not what was asked for")
 live_size_follows_the_block()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     root_a = ptr_cast(new_obj(&h, 1))
 
@@ -292,7 +297,7 @@ end live_size_follows_the_block
 @test("two object kinds are traced by their own hooks")
 type_erasure_holds()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     // An Obj pointing at a Chain pointing at an Obj: every edge crosses a layout boundary, so a
     // sweep that survives this one is reading the hook rather than assuming a shape.
@@ -318,7 +323,7 @@ end type_erasure_holds
 exhaustion_is_reported()
     // Room for a handful of objects and no more.
     var block = fresh(256)
-    var h = heap(&block[0], 256)
+    var h = heap(&block[0], 256, null)
 
     var made = 0
     loop
@@ -340,7 +345,7 @@ end exhaustion_is_reported
 @test("two roots each keep their own graph")
 roots_are_independent()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val a = new_obj(&h, 1)
     val a_child = new_obj(&h, 2)
@@ -372,7 +377,7 @@ end roots_are_independent
 alloc_does_not_walk_the_whole_free_list()
     val cap: usize = 48 * 1024 * 1024
     var block = fresh(cap)
-    var h = heap(&block[0], cap)
+    var h = heap(&block[0], cap, null)
 
     // A hundred thousand small blocks freed, each one separated from the next by a survivor.
     var head: *Chain = null
@@ -417,7 +422,7 @@ end alloc_does_not_walk_the_whole_free_list
 reuse_of_a_class_costs_one_look()
     val cap: usize = 8 * 1024 * 1024
     var block = fresh(cap)
-    var h = heap(&block[0], cap)
+    var h = heap(&block[0], cap, null)
 
     var head: *Chain = null
     var i = 0
@@ -459,7 +464,7 @@ end reuse_of_a_class_costs_one_look
 @test("neighbours freed in one sweep become one block, so something larger fits afterwards")
 adjacent_free_blocks_merge()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     // Small objects until the block is full, and every one of them dies.
     var made = 0
@@ -491,7 +496,7 @@ end adjacent_free_blocks_merge
 @test("a block handed to a smaller request gives its remainder back")
 a_split_block_leaves_the_rest_usable()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val big = alloc(&h, 8192, &obj_kind)
 
@@ -517,7 +522,7 @@ end a_split_block_leaves_the_rest_usable
 @test("a heap filled with mixed sizes, swept and filled again holds exactly as much")
 exhaustion_survives_a_round_trip()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     var first = 0
 
@@ -566,7 +571,7 @@ private assert_mask_agrees(h: *Heap, note: string)
 the_mask_agrees_with_the_bins()
     val cap: usize = 1024 * 1024
     var block = fresh(cap)
-    var h = heap(&block[0], cap)
+    var h = heap(&block[0], cap, null)
 
     assert_mask_agrees(&h, "a fresh heap has no classes and no bits")
 
@@ -618,7 +623,7 @@ end the_mask_agrees_with_the_bins
 an_empty_class_reaches_the_next_one()
     val cap: usize = 256 * 1024
     var block = fresh(cap)
-    var h = heap(&block[0], cap)
+    var h = heap(&block[0], cap, null)
 
     val big = alloc(&h, 16384, &obj_kind)
 
@@ -652,7 +657,7 @@ end an_empty_class_reaches_the_next_one
 the_last_block_of_a_class_clears_its_bit()
     val cap: usize = 1024 * 1024
     var block = fresh(cap)
-    var h = heap(&block[0], cap)
+    var h = heap(&block[0], cap, null)
 
     // Dead objects separated by survivors, so that no two of them merge and the class keeps them
     // all as blocks of its own size.
@@ -698,7 +703,7 @@ end the_last_block_of_a_class_clears_its_bit
 @test("the bit scan answers at both ends of the mask and across its two words")
 the_bit_scan_covers_every_class()
     var block = fresh(1024)
-    var h = heap(&block[0], 1024)
+    var h = heap(&block[0], 1024, null)
 
     assert_eq(first_bin_from(&h, 0), NBINS, "an empty mask has no class to offer")
 
@@ -739,7 +744,7 @@ end the_bit_scan_covers_every_class
 a_sweep_rebuilds_the_mask()
     val cap: usize = 256 * 1024
     var block = fresh(cap)
-    var h = heap(&block[0], cap)
+    var h = heap(&block[0], cap, null)
 
     var i = 0
 
@@ -777,7 +782,7 @@ end a_sweep_rebuilds_the_mask
 @test("a finalizer runs for what dies and not for what survives")
 finalizer_runs_once_per_death()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
     finalized = 0
 
     val keep = new_obj_of(&h, 1, &counted_kind)
@@ -797,7 +802,7 @@ end finalizer_runs_once_per_death
 @test("a kind with no finalizer is swept without one")
 no_finalizer_is_not_a_null_call()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
     finalized = 0
 
     val plain = new_obj(&h, 1)
@@ -814,7 +819,7 @@ end no_finalizer_is_not_a_null_call
 @test("dispose finalizes what is still live, which is what shutdown needs")
 dispose_finalizes_survivors()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
     finalized = 0
 
     val a = new_obj_of(&h, 1, &counted_kind)
@@ -841,7 +846,7 @@ end dispose_finalizes_survivors
 @test("a kind with no finalizer is swept and its storage handed back")
 plain_kind_storage_is_reused()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     for i in 0..<COUNT
         val o = new_obj(&h, int(i))
@@ -864,7 +869,7 @@ end plain_kind_storage_is_reused
 @test("a finalizer is called exactly once for each dead object, and handed that object")
 finalizer_once_per_dead_object()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
     clear_seen()
 
     var kept: *Obj = null
@@ -894,7 +899,7 @@ end finalizer_once_per_dead_object
 @test("objects of several kinds die in one sweep, each finalized by its own kind or not at all")
 mixed_kinds_in_one_sweep()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
     clear_seen()
     finalized = 0
 
@@ -939,7 +944,7 @@ end mixed_kinds_in_one_sweep
 @test("the sweep hands every freed cell back to the allocator, and no cell twice")
 every_freed_cell_is_handed_out()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     // Every other object survives, so no two dead cells are neighbours and none is merged: each
     // one comes back as the cell it was.
@@ -989,7 +994,7 @@ end every_freed_cell_is_handed_out
 @test("a weak object that outlives a sweep of its neighbours is still found by the next weak pass")
 weak_survivor_stays_on_the_list()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val target = new_obj(&h, 1)
     for i in 0..<COUNT / 2
@@ -1017,7 +1022,7 @@ end weak_survivor_stays_on_the_list
 @test("a weak reference does not keep its target alive and is cleared when it dies")
 weak_ref_is_cleared()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val target = new_obj(&h, 42)
     val w = new_weakref(&h, ptr_cast(target))
@@ -1036,7 +1041,7 @@ end weak_ref_is_cleared
 @test("a weak reference to a live target is left alone")
 weak_ref_survives_live_target()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val target = new_obj(&h, 42)
     val w = new_weakref(&h, ptr_cast(target))
@@ -1055,7 +1060,7 @@ end weak_ref_survives_live_target
 @test("a weak map value is kept alive by its key")
 ephemeron_key_keeps_value()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val m = new_weakmap(&h)
     val key = new_obj(&h, 1)
@@ -1075,7 +1080,7 @@ end ephemeron_key_keeps_value
 @test("a weak map entry whose key died is dropped, and takes its value with it")
 ephemeron_dead_key_drops_entry()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val m = new_weakmap(&h)
     val key = new_obj(&h, 1)
@@ -1096,7 +1101,7 @@ end ephemeron_dead_key_drops_entry
 @test("a value referring back to its own key does not keep the pair alive")
 ephemeron_self_reference_is_collected()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val m = new_weakmap(&h)
     val key = new_obj(&h, 1)
@@ -1120,7 +1125,7 @@ end ephemeron_self_reference_is_collected
 @test("one entry's value being another entry's key resolves by iterating")
 ephemeron_chain_reaches_fixpoint()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val m = new_weakmap(&h)
     val k1 = new_obj(&h, 1)
@@ -1151,7 +1156,7 @@ private var ephemeron_only_kind: Kind = Kind(&trace_nothing, null, null, &epheme
 @test("a heap holding no weak object collects correctly and never walks for the weak passes")
 no_weak_object_skips_both_passes()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val a = new_obj(&h, 1)
     val b = new_chain(&h, 2)
@@ -1176,7 +1181,7 @@ end no_weak_object_skips_both_passes
 @test("a weak map drops an entry whose key died and keeps a value its live key reaches, counted once")
 weak_map_is_counted_and_its_passes_run()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val m = new_weakmap(&h)
     val live_key = new_obj(&h, 1)
@@ -1208,7 +1213,7 @@ end weak_map_is_counted_and_its_passes_run
 @test("the count falls when the weak object dies, and the next collection skips the weak passes")
 dead_weak_object_stops_the_passes()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val keep = new_obj(&h, 1)
     val m = new_weakmap(&h)
@@ -1241,8 +1246,8 @@ end dead_weak_object_stops_the_passes
 two_heaps_count_apart()
     var block_a = fresh(65536)
     var block_b = fresh(65536)
-    var ha = heap(&block_a[0], 65536)
-    var hb = heap(&block_b[0], 65536)
+    var ha = heap(&block_a[0], 65536, null)
+    var hb = heap(&block_b[0], 65536, null)
 
     new_weakmap(&ha)
     new_weakref(&ha, null)
@@ -1267,7 +1272,7 @@ end two_heaps_count_apart
 @test("dispose zeroes the counts")
 dispose_zeroes_the_counts()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     new_weakmap(&h)
     new_weakref(&h, null)
@@ -1286,7 +1291,7 @@ end dispose_zeroes_the_counts
 @test("a kind with only a weaken hook is counted and its pass runs with no ephemeron pass")
 weaken_only_kind_counts()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val target = new_obj(&h, 1)
     val w = new_weakref(&h, ptr_cast(target))
@@ -1305,7 +1310,7 @@ end weaken_only_kind_counts
 @test("a kind with only an ephemeron hook is counted and its pass runs with no weaken pass")
 ephemeron_only_kind_counts()
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     // Through `alloc_raw`, so the raw entry point is shown to count as well.
     val raw = alloc_raw(&h, sizeof(WeakMap), &ephemeron_only_kind)
@@ -1345,7 +1350,7 @@ private dirty(bytes: usize) -> []u8 = [255; bytes]
 @test("a fresh payload is zeroed, over a block that never was")
 alloc_zeroes_a_new_payload()
     var block = dirty(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val raw = alloc(&h, 64, &obj_kind)
 
@@ -1362,7 +1367,7 @@ end alloc_zeroes_a_new_payload
 @test("a payload reused from the free list is zeroed too")
 alloc_zeroes_a_reused_payload()
     var block = dirty(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val first = alloc(&h, 64, &obj_kind)
 
@@ -1389,7 +1394,7 @@ end alloc_zeroes_a_reused_payload
 @test("a payload split out of a bigger swept block is zeroed too")
 alloc_zeroes_a_split_payload()
     var block = dirty(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val big = alloc(&h, 8192, &obj_kind)
 
@@ -1504,7 +1509,7 @@ end classifier_stays_in_range
 @test("alloc_raw leaves the payload as the block was, which is the whole of what it buys")
 raw_payload_is_untouched()
     var block = dirty(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val raw = alloc_raw(&h, 64, &obj_kind)
 
@@ -1525,7 +1530,7 @@ end raw_payload_is_untouched
 @test("a raw block is cut from the class alloc would have used, and the next one does not overlap it")
 raw_block_is_classed_like_any_other()
     var plain = fresh(65536)
-    var hp = heap(&plain[0], 65536)
+    var hp = heap(&plain[0], 65536, null)
 
     val by_alloc = alloc(&hp, 80, &obj_kind)
 
@@ -1534,7 +1539,7 @@ raw_block_is_classed_like_any_other()
     val cost = live_size(&hp)
 
     var block = fresh(65536)
-    var h = heap(&block[0], 65536)
+    var h = heap(&block[0], 65536, null)
 
     val first = alloc_raw(&h, 80, &obj_kind)
 
@@ -1560,7 +1565,7 @@ end raw_block_is_classed_like_any_other
 @test("raw objects are traced, swept and their storage reused like any other")
 raw_objects_leak_nothing()
     var block = dirty(1048576)
-    var h = heap(&block[0], 1048576)
+    var h = heap(&block[0], 1048576, null)
 
     var round = 0
 
@@ -1634,7 +1639,7 @@ private refused(h: *Heap, arena: *u8, len: usize, size: usize) -> bool
 // The largest payload a fresh heap of `cap` bytes can hand out, found by asking.
 private largest(cap: usize) -> usize
     var block = dirty(cap)
-    var h = heap(&block[0], cap)
+    var h = heap(&block[0], cap, null)
     var n = cap
 
     loop
@@ -1646,7 +1651,7 @@ private largest(cap: usize) -> usize
 @test("a request of the largest usize is refused, not wrapped into a small block")
 alloc_refuses_max_usize()
     var block = dirty(4096)
-    var h = heap(&block[0], 4096)
+    var h = heap(&block[0], 4096, null)
 
     assert(alloc_raw(&h, ~0usize, &obj_kind) == null, "alloc_raw")
     assert(alloc(&h, ~0usize, &obj_kind) == null, "alloc")
@@ -1661,7 +1666,7 @@ alloc_boundary_is_exact()
     assert(top > 4000 && top < 4096, "the largest payload is the arena less one header")
 
     var block = dirty(4096)
-    var h = heap(&block[0], 4096)
+    var h = heap(&block[0], 4096, null)
 
     assert(refused(&h, &block[0], 4096, top + 1), "one byte over")
     assert(refused(&h, &block[0], 4096, top + 16), "a grain over")
@@ -1672,7 +1677,7 @@ end alloc_boundary_is_exact
 @test("a size whose rounding alone overflows is refused")
 alloc_refuses_sizes_that_wrap_when_rounded()
     var block = dirty(4096)
-    var h = heap(&block[0], 4096)
+    var h = heap(&block[0], 4096, null)
 
     for k in 0..<64
         assert(refused(&h, &block[0], 4096, ~0usize - usize(k)), "~0 minus a small k")
@@ -1684,7 +1689,7 @@ end alloc_refuses_sizes_that_wrap_when_rounded
 @test("a size that fits arithmetically but exceeds the arena is refused")
 alloc_refuses_larger_than_arena()
     var block = dirty(4096)
-    var h = heap(&block[0], 4096)
+    var h = heap(&block[0], 4096, null)
 
     assert(refused(&h, &block[0], 4096, 4096), "the arena itself")
     assert(refused(&h, &block[0], 4096, 8192), "twice the arena")
@@ -1694,12 +1699,12 @@ end alloc_refuses_larger_than_arena
 @test("an arena claimed to span the whole address space is cut so no request can wrap")
 alloc_refuses_wrapping_sizes_on_a_huge_claimed_arena()
     var block = dirty(4096)
-    var h = heap(&block[0], ~0usize)
+    var h = heap(&block[0], ~0usize, null)
 
     // A zero-byte block is a header rounded up to a grain, so the header is more than a grain
     // exactly when that is more than one.
     var probe = dirty(4096)
-    var p = heap(&probe[0], 4096)
+    var p = heap(&probe[0], 4096, null)
 
     assert(alloc_raw(&p, 0, &obj_kind) != null)
     assert(used(&p) > GRAIN, "a header is longer than a grain")
@@ -1718,8 +1723,8 @@ end alloc_refuses_wrapping_sizes_on_a_huge_claimed_arena
 refusal_leaves_heap_as_fresh()
     var b1 = dirty(4096)
     var b2 = dirty(4096)
-    var fresh_heap = heap(&b1[0], 4096)
-    var refused_heap = heap(&b2[0], 4096)
+    var fresh_heap = heap(&b1[0], 4096, null)
+    var refused_heap = heap(&b2[0], 4096, null)
 
     assert(refused(&refused_heap, &b2[0], 4096, ~0usize), "~0")
     assert(refused(&refused_heap, &b2[0], 4096, ~0usize - 7), "~0 - 7")
@@ -1736,7 +1741,7 @@ end refusal_leaves_heap_as_fresh
 @test("alloc zeroes nothing and writes no length when it refuses")
 alloc_refusal_does_not_touch_memory()
     var block = dirty(4096)
-    var h = heap(&block[0], 4096)
+    var h = heap(&block[0], 4096, null)
 
     assert(alloc(&h, ~0usize, &obj_kind) == null)
     assert(alloc(&h, ~0usize - 15, &obj_kind) == null)
@@ -1748,7 +1753,7 @@ end alloc_refusal_does_not_touch_memory
 @test("a refusal after blocks were freed, split and coalesced still changes nothing")
 refusal_after_free_split_coalesce()
     var block = dirty(16384)
-    var h = heap(&block[0], 16384)
+    var h = heap(&block[0], 16384, null)
 
     for i in 0..<40
         assert(alloc(&h, 16 + usize(i % 7) * 40, &obj_kind) != null)
@@ -1781,7 +1786,7 @@ private inside(p: *u8, size: usize, base: *u8, cap: usize) -> bool
 // The largest payload a fresh heap of `cap` bytes at offset `shift` of a block can hand out.
 private largest_from(shift: usize, cap: usize) -> usize
     var block = dirty(cap + 16)
-    var h = heap(&block[shift], cap)
+    var h = heap(&block[shift], cap, null)
     var n = cap
 
     loop
@@ -1795,7 +1800,7 @@ payloads_fresh_are_16_aligned()
     var block = dirty(16384 + 16)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 16384)
+        var h = heap(&block[shift], 16384, null)
 
         for i in 0..<40
             val size = 1 + usize(i) * 13 % 300
@@ -1812,7 +1817,7 @@ payloads_split_from_coalesced_are_16_aligned()
     var block = dirty(16384 + 16)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 16384)
+        var h = heap(&block[shift], 16384, null)
 
         for i in 0..<40
             assert(alloc(&h, 1 + usize(i) * 13 % 300, &obj_kind) != null)
@@ -1833,7 +1838,7 @@ payloads_split_from_free_block_are_16_aligned()
     var block = dirty(16384 + 16)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 16384)
+        var h = heap(&block[shift], 16384, null)
 
         assert(alloc(&h, 3000, &obj_kind) != null)
         root_a = null
@@ -1849,7 +1854,7 @@ payloads_reused_from_exact_class_are_16_aligned()
     var block = fresh(16384 + 16)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 16384)
+        var h = heap(&block[shift], 16384, null)
         var prev: *Obj = null
 
         // Dead and live objects alternate, so each dead one is a hole between live neighbours that
@@ -1881,7 +1886,7 @@ tiny_arenas_refuse_cleanly()
         var block = dirty(cap + 48)
 
         for shift in 0..<16
-            var h = heap(&block[shift], cap)
+            var h = heap(&block[shift], cap, null)
             val p = alloc(&h, 1, &obj_kind)
 
             if cap < 16
@@ -1906,7 +1911,7 @@ arena_shorter_than_lead_holds_nothing()
 
     for shift in 0..<16
         for cap in 0..<16
-            var h = heap(&block[shift], cap)
+            var h = heap(&block[shift], cap, null)
             assert(alloc(&h, 1, &obj_kind) == null, "alloc")
             assert(alloc_raw(&h, 0, &obj_kind) == null, "alloc_raw")
             assert_eq(used(&h), 0)
@@ -1927,7 +1932,7 @@ largest_request_at_every_offset()
         assert(best - top <= 16, "the lead costs at most one grain of payload")
 
         var block = dirty(4096 + 16 + 32)
-        var h = heap(&block[shift], 4096)
+        var h = heap(&block[shift], 4096, null)
 
         assert(refused(&h, &block[shift], 4096, top + 1), "one byte over")
         assert(refused(&h, &block[shift], 4096, top + 16), "a grain over")
@@ -1947,7 +1952,7 @@ counters_ignore_the_lead()
     var first: Snap = Snap(0, 0, 0, 0, 0, 0)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 16384)
+        var h = heap(&block[shift], 16384, null)
 
         for i in 0..<30
             assert(alloc(&h, 1 + usize(i) * 13 % 300, &obj_kind) != null)
@@ -1970,7 +1975,7 @@ dispose_over_offset_arena()
     var block = fresh(65536 + 16)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 65536)
+        var h = heap(&block[shift], 65536, null)
         finalized = 0
 
         val a = new_obj_of(&h, 1, &counted_kind)
@@ -1997,7 +2002,7 @@ ephemeron_over_offset_arena()
     var block = fresh(65536 + 16)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 65536)
+        var h = heap(&block[shift], 65536, null)
 
         val m = new_weakmap(&h)
         val key = new_obj(&h, 1)
@@ -2023,7 +2028,7 @@ weakref_over_offset_arena()
     var block = fresh(65536 + 16)
 
     for shift in 0..<16
-        var h = heap(&block[shift], 65536)
+        var h = heap(&block[shift], 65536, null)
 
         val target = new_obj(&h, 1)
         val w = new_weakref(&h, ptr_cast(target))
@@ -2038,3 +2043,258 @@ weakref_over_offset_arena()
         collect(&h, &roots_ab)
         assert(w.target == null, "cleared once the target is dead")
 end weakref_over_offset_arena
+
+// -- The context, the kind and the finalizer's heap ------------------------------------------------
+
+private var ctx_a: int = 0
+private var ctx_b: int = 0
+
+@test("a heap answers the context it was made with, null included")
+context_round_trips()
+    var block_a = fresh(4096)
+    var block_b = fresh(4096)
+    var ha = heap(&block_a[0], 4096, ptr_cast(&ctx_a))
+    var hb = heap(&block_b[0], 4096, ptr_cast(&ctx_b))
+    var hn = heap(&block_a[0], 4096, null)
+
+    assert(context(&ha) == ptr_cast(&ctx_a), "the first heap's own context")
+    assert(context(&hb) == ptr_cast(&ctx_b), "the second heap's, not the first's")
+    assert(context(&hn) == null, "null is a context like any other")
+    assert(context(&ha) != context(&hb))
+
+@test("the context survives allocation, collection and dispose unchanged")
+context_survives_the_heap_working()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, ptr_cast(&ctx_a))
+
+    root_a = ptr_cast(new_obj(&h, 1))
+    new_obj(&h, 2)
+    collect(&h, &roots_ab)
+    assert(context(&h) == ptr_cast(&ctx_a), "after a collection")
+    dispose(&h)
+    assert(context(&h) == ptr_cast(&ctx_a), "after dispose")
+    root_a = null
+
+// A finalizer that reaches the client's state through the heap it is handed -- the reason it is
+// handed one.
+private ctx_finalize(p: *u8, h: *Heap)
+    var n: *int = ptr_cast(context(h))
+    n[0] += 1
+
+private var ctx_kind: Kind = Kind(&trace_obj, &ctx_finalize, null, null)
+
+@test("a finalizer is handed the heap being swept, and reaches its context through it")
+finalizer_reaches_the_context()
+    var block_a = fresh(65536)
+    var block_b = fresh(65536)
+    var ha = heap(&block_a[0], 65536, ptr_cast(&ctx_a))
+    var hb = heap(&block_b[0], 65536, ptr_cast(&ctx_b))
+    ctx_a = 0
+    ctx_b = 0
+
+    for i in 0..<3
+        new_obj_of(&ha, i, &ctx_kind)
+    for i in 0..<5
+        new_obj_of(&hb, i, &ctx_kind)
+
+    collect(&ha, &no_roots)
+    assert_eq(ctx_a, 3, "the first heap's three, counted in its own context")
+    assert_eq(ctx_b, 0, "and nothing in the other's")
+
+    new_obj_of(&hb, 9, &ctx_kind)
+    dispose(&hb)
+    assert_eq(ctx_b, 6, "dispose hands its finalizers the heap too")
+    assert_eq(ctx_a, 3)
+
+@test("a finalizer's heap is the heap whose sweep or dispose called it")
+finalizer_is_handed_its_own_heap()
+    var block_a = fresh(65536)
+    var block_b = fresh(65536)
+    var ha = heap(&block_a[0], 65536, null)
+    var hb = heap(&block_b[0], 65536, null)
+
+    new_obj_of(&ha, 1, &counted_kind)
+    new_obj_of(&hb, 2, &counted_kind)
+
+    finalized_on = null
+    collect(&ha, &no_roots)
+    assert(finalized_on == &ha, "the sweep of the first heap hands over the first")
+
+    finalized_on = null
+    collect(&hb, &no_roots)
+    assert(finalized_on == &hb, "and of the second, the second")
+
+    new_obj_of(&ha, 3, &counted_kind)
+    finalized_on = null
+    dispose(&ha)
+    assert(finalized_on == &ha, "dispose hands over the heap it is emptying")
+
+@test("kind_of answers the kind each object was allocated with")
+kind_of_answers_the_allocation_kind()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+
+    val a = new_obj(&h, 1)
+    val c = new_chain(&h, 2)
+    val raw = alloc_raw(&h, sizeof(Obj), &counted_kind)
+    val zero_size = alloc(&h, 0, &chain_kind)
+
+    assert(kind_of(ptr_cast(a)) == &obj_kind, "an Obj")
+    assert(kind_of(ptr_cast(c)) == &chain_kind, "a Chain, which is a different kind")
+    assert(kind_of(raw) == &counted_kind, "an alloc_raw block")
+    assert(kind_of(zero_size) == &chain_kind, "a zero-byte object has a kind too")
+    assert_eq(KIND_BACK, 2 * sizeof(usize), "two words back, on any target")
+
+@test("a block reused for another kind answers the new kind")
+kind_of_follows_reuse()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+
+    val first: *u8 = ptr_cast(new_obj(&h, 1))
+    collect(&h, &no_roots)
+    val second: *u8 = ptr_cast(new_obj_of(&h, 2, &counted_kind))
+
+    assert(second == first, "the swept block is handed straight back")
+    assert(kind_of(second) == &counted_kind, "and reports its new kind")
+
+// A client descriptor that begins with a `Kind` and carries its own data after it. The tracer finds
+// the descriptor through `kind_of`, which is how a runtime with one tracer for every type works.
+private struct Desc
+    kind: Kind
+    slots: usize
+    tag: usize
+
+@assert(offsetof(Desc, kind) == 0, "a client descriptor begins with its Kind")
+
+private trace_by_desc(p: *u8, h: *Heap)
+    val d: *Desc = ptr_cast(kind_of(p))
+    val o: *Obj = ptr_cast(p)
+    for i in 0..<d.slots
+        mark(h, o.props[i])
+
+private var desc_one: Desc = Desc(Kind(&trace_by_desc, null, null, null), 1, 11)
+private var desc_all: Desc = Desc(Kind(&trace_by_desc, null, null, null), SLOTS, 22)
+
+@test("a descriptor that begins with a Kind is found through kind_of and traces by its own data")
+descriptor_found_through_kind_of()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+
+    val one = new_obj_of(&h, 1, &desc_one.kind)
+    val all = new_obj_of(&h, 2, &desc_all.kind)
+    val d: *Desc = ptr_cast(kind_of(ptr_cast(all)))
+    assert_eq(d.tag, 22, "the client's own field, read through kind_of")
+
+    // `one` traces only its first slot and `all` every slot, so what survives says which
+    // descriptor each tracer read.
+    one.props[0] = ptr_cast(new_obj(&h, 3))
+    one.props[1] = ptr_cast(new_obj(&h, 4))
+    all.props[0] = ptr_cast(new_obj(&h, 5))
+    all.props[3] = ptr_cast(new_obj(&h, 6))
+
+    root_a = ptr_cast(one)
+    root_b = ptr_cast(all)
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 5, "one, all, one's first slot and both of all's; one's second slot dies")
+    root_a = null
+    root_b = null
+
+// A constant built outside the arena, laid out as the contract says: a kind pointer, then a word the
+// client leaves zero, then the payload.
+private struct Forged
+    kind: *Kind
+    word: usize
+    value: Obj
+
+private var forged: Forged = Forged(&obj_kind, 0, Obj(7, [null; SLOTS]))
+
+private forged_payload() -> *u8 = ptr_cast(&forged.value)
+
+@test("kind_of answers for a constant outside the arena whose kind word the client forged")
+kind_of_on_a_forged_constant()
+    assert(kind_of(forged_payload()) == &obj_kind, "the forged kind")
+    assert_eq(forged.word, 0, "and the word after it is the client's zero")
+
+// -- The checks option ----------------------------------------------------------------------------
+//
+// Each of these traps only with `checks` on, so with it off each one says it was skipped rather than
+// reporting a pass it did not earn. `sysl test . --option checks=true` runs them.
+
+private needs_checks()
+    if !option_checks then skip("the checks option is off: run with --option checks=true")
+
+@test("under checks, an allocation naming no kind traps", should_trap)
+checks_trap_a_null_kind()
+    needs_checks()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    alloc(&h, 16, null)
+
+private var traceless_kind: Kind = Kind(null, null, null, null)
+
+@test("under checks, an allocation naming a kind with no tracer traps", should_trap)
+checks_trap_a_kind_without_a_tracer()
+    needs_checks()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    alloc_raw(&h, 16, &traceless_kind)
+
+@test("under checks, marking an object the last sweep freed traps", should_trap)
+checks_trap_a_mark_of_a_freed_object()
+    needs_checks()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    val p: *u8 = ptr_cast(new_obj(&h, 1))
+    collect(&h, &no_roots)
+    mark(&h, p)
+
+@test("under checks, is_live of an object the last sweep freed traps", should_trap)
+checks_trap_is_live_of_a_freed_object()
+    needs_checks()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    new_obj(&h, 0)
+    val p: *u8 = ptr_cast(new_obj(&h, 1))
+    collect(&h, &no_roots)
+    is_live(&h, p)
+
+@test("under checks, marking a pointer into the middle of a payload traps", should_trap)
+checks_trap_a_misaligned_mark()
+    needs_checks()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    val p: *u8 = ptr_cast(new_obj(&h, 1))
+    mark(&h, &p[8])
+
+@test("under checks, a sweep over a block whose length was overwritten traps", should_trap)
+checks_trap_a_broken_tiling()
+    needs_checks()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    root_a = ptr_cast(new_obj(&h, 1))
+    val last: *u8 = ptr_cast(new_obj(&h, 2))
+
+    // The word after the kind is the collector's length word; a grain more than the block is a
+    // block that runs past the end of the used part. The first object is kept, so the only thing
+    // wrong with the heap the sweep leaves is the tiling.
+    var size_word: *usize = ptr_cast(usize(last) - KIND_BACK + sizeof(usize))
+    size_word[0] = size_word[0] + GRAIN
+    collect(&h, &roots_ab)
+
+@test("with checks on or off, a well-formed heap runs every operation without a trap")
+checks_pass_a_well_formed_heap()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+
+    for round in 0..<4
+        val keep = new_obj(&h, round)
+        keep.props[0] = ptr_cast(new_chain(&h, round))
+        new_obj(&h, 100 + round)
+        alloc(&h, 0, &obj_kind)
+        alloc(&h, 2000, &chain_kind)
+        root_a = ptr_cast(keep)
+        collect(&h, &roots_ab)
+        assert_mask_agrees(&h, "after a checked sweep")
+    dispose(&h)
+    assert_eq(live(&h), 0)
+    root_a = null

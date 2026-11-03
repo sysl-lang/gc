@@ -11,8 +11,11 @@ import sh.sysl.gc
 
 // One block, from anywhere. A static array on a board, a malloc on a laptop.
 var storage: [65536]u8 = [0u8; 65536]
-var h = gc.heap(&storage[0], 65536)
+var h = gc.heap(&storage[0], 65536, null)
 ```
+
+The third argument is the heap's context: the client's own state, which a hook reads back with
+`gc.context(h)`. `null` is fine for a client that keeps none.
 
 ## What a client writes
 
@@ -141,10 +144,13 @@ anything real.
 | `weaken` | after marking, before the sweep | clear slots whose targets did not survive |
 | `ephemeron` | between marking passes | mark the values whose keys turned out live |
 
-**`finalize` is handed the payload and not the heap, and that is the contract rather than an
-oversight.** A finalizer runs while the sweep is walking the block, so it may not allocate, may
-not mark and may not resurrect. Taking no `*Heap` puts all three out of reach, so the rule is enforced
-by the signature instead of by a warning in a comment.
+Every hook is handed the payload and the heap: `trace`, `finalize` and `weaken` as `(*u8, *Heap) ->
+unit`, `ephemeron` as `(*u8, *Heap) -> bool`.
+
+**`finalize` is handed the heap so that it can reach `context(h)`**, which is how a runtime's
+finalizer gives a handle back to the runtime without a global. That is all the heap is for there: a
+finalizer runs while the sweep is walking the block, so it may not allocate, may not mark and may not
+resurrect what it is finalizing.
 
 **`weaken` is what a `WeakRef` is.** An object whose `trace` does not mark its target, plus a `weaken`
 that nulls the target once marking has decided the target is dead. It runs before anything is freed,
@@ -173,6 +179,76 @@ once its two reserves stopped counting.
 
 `dispose` finalizes everything still live and empties the heap. Without it, a finalizer that closes a
 file or releases a `Buf` never runs for anything still reachable when the program stops.
+
+## The context
+
+```sysl
+heap(base: *u8, cap: usize, ctx: *u8) -> Heap
+context(h: *Heap) -> *u8
+```
+
+`ctx` is whatever the client's hooks need to find its own state — an interpreter's `Vm`, a runtime's
+shared tables — and `context` hands it back with one load. **It is per heap, not per thread**: one
+heap has one context whatever thread is running, there is no global and no thread-local, and there is
+no setter, so the context is fixed when the heap is made. The collector never reads through it.
+
+A client that already finds its state another way passes `null`. One that embeds the `Heap` in its own
+state struct can recover that struct from `h` by subtracting the field's `offsetof`, which costs no
+load at all.
+
+## An object's kind, and a client's own descriptors
+
+```sysl
+const KIND_BACK: usize = 2 * sizeof(usize)
+kind_of(p: *u8) -> *Kind
+```
+
+`kind_of(p)` answers the `*Kind` the object was allocated with, read from `p - KIND_BACK` in one load.
+**`KIND_BACK` is frozen for 0.3.x** — 16 bytes on a 64-bit target, 8 on a 32-bit one — so generated
+code may load an object's kind inline without calling anything.
+
+**The `Kind` layout is frozen too: four pointer-sized hooks, `trace`, `finalize`, `weaken`,
+`ephemeron`, in that order.** That is what lets a client begin its own per-type descriptor with a
+`Kind` and extend it past the `Kind` as far as it likes — a variant tag, a field count, a name, a
+table of offsets. It hands `alloc` the address of the descriptor, and `kind_of` gives the descriptor
+back:
+
+```sysl
+struct Descriptor
+    kind: gc.Kind          // offset 0
+    tag: usize
+    refs: usize
+
+@assert(offsetof(Descriptor, kind) == 0, "a descriptor begins with its Kind")
+
+trace(p: *u8, h: *gc.Heap)
+    val d: *Descriptor = ptr_cast(gc.kind_of(p))
+    ...
+
+var p = gc.alloc(h, size, &d.kind)
+```
+
+One tracer then serves every type, reading what to trace from the descriptor, and a `match` on a
+variant reads its tag through the same load.
+
+## Checks
+
+```hocon
+gc { git = "github.com/sysl-lang/gc", version = "0.3.0", options = { checks = true } }
+```
+
+The `checks` option (default `false`) validates the heap as it runs and traps on the first fault:
+
+- `alloc` / `alloc_raw` with a `null` kind, or a kind whose `trace` is `null`;
+- `mark` / `is_live` of a pointer that is not the payload of a live object of this heap — a freed
+  block, a pointer into the middle of a payload, a misaligned one;
+- after every sweep and every `dispose`: the blocks tile the used part of the arena exactly, no two
+  free blocks are neighbours, every free block is on the bin for its size and every bin holds only
+  its own class, and the class mask agrees with the bins.
+
+**Off, it costs nothing.** Every guarded site is `if option_checks then …` over a constant, so at
+`false` the code is not compiled at all. The traps are `trap()`, which needs no capability, so a
+checked build still runs on a bare-metal target.
 
 ## Why it runs anywhere sysl runs
 
@@ -356,11 +432,27 @@ whether its own workload is paying for a search.
 Each of those is a thing to fix if it ever matters, and none of them is load-bearing on the
 interface.
 
+## Migrating from 0.2.10
+
+- **`heap` takes a third argument, the context.** `gc.heap(base, cap)` becomes `gc.heap(base, cap,
+  null)`, or the client's state where its hooks want `gc.context(h)`.
+- **A `Finalizer` is handed the heap.** `finalize_x(p: *u8)` becomes `finalize_x(p: *u8, h:
+  *gc.Heap)`; a finalizer that has no use for it ignores it.
+- **New, and needing no change:** `context`, `kind_of`, `KIND_BACK` and the `checks` option. A
+  client that kept a descriptor pointer in its payload's first word can move it into a `Kind`-first
+  descriptor and read it with `kind_of`, which saves the word in every object.
+
 ## Tests
 
 ```
 sysl test .
+sysl test . --option checks=true
+SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
 ```
+
+The suite runs both ways. With `checks` off the tests that exist to see a check trap say `skip`, so a
+plain run reports what it did not exercise rather than passing them unearned; with it on they run,
+and every other test runs with the heap validated after every sweep.
 
 44 of them, and the ones that matter most are checked by falsification rather than by passing: with
 the weak map's values marked strongly instead of through the ephemeron hook,

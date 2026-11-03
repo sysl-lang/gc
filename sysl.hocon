@@ -44,3 +44,14 @@ package {
 // freestanding one does is point at a static array. Neither is a special case in this package.
 requires {
 }
+
+// **`checks` validates the heap as it runs, and costs nothing when it is off.** Every place it guards
+// is `if option_checks then ...` over a constant, so at `false` -- the default -- the guarded code is
+// not compiled at all. A consumer turns it on for a debugging build:
+//
+//     gc { git = "github.com/sysl-lang/gc", version = "0.3.0", options = { checks = true } }
+//
+// and this package's own suite runs both ways: `sysl test .` and `sysl test . --option checks=true`.
+options {
+  checks { type = bool, default = false, doc = "validate every mark, alloc and sweep, trapping on the first fault (slow)" }
+}

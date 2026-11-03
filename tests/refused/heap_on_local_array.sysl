@@ -11,5 +11,5 @@ private var kind: gc.Kind = gc.Kind(&noop, null, null, null)
 
 boot() -> int
     var block: [4096 + 16]u8 = [255u8; 4096 + 16]
-    var h = gc.heap(&block[0], 4096)
+    var h = gc.heap(&block[0], 4096, null)
     if gc.alloc(&h, 8, &kind) == null then 1 else 0

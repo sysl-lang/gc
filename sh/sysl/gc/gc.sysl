@@ -51,13 +51,13 @@ import sysl.raw.ptr_cast
 type Tracer = *extern(*u8, *Heap) -> unit
 
 // Release what this object owns outside the collected heap -- a `string`, a `Buf`, a file
-// descriptor, a C allocation. Runs during the sweep that frees the object.
+// descriptor, a C allocation. Runs during the sweep that frees the object, and from `dispose`.
 //
-// **It is handed the payload and NOT the heap, which is the contract rather than an oversight.** A
-// finalizer runs while the sweep is walking the object list, so it may not allocate, may not mark,
-// and may not resurrect what it is finalizing. Taking no `*Heap` means none of those is reachable
-// from inside one, so the rule is enforced by the signature instead of by a warning in a comment.
-type Finalizer = *extern(*u8) -> unit
+// **It is handed the heap so that it can reach `context(h)`** -- a runtime whose finalizers give a
+// handle back to the runtime needs the runtime, and without the heap the only way to it is a global.
+// The heap is for reading the context and nothing else: a finalizer runs while the sweep is walking
+// the block, so it may not allocate, may not mark and may not resurrect what it is finalizing.
+type Finalizer = *extern(*u8, *Heap) -> unit
 
 // Clear this object's weak slots. Runs after marking is final and before the sweep, on live objects
 // only, and its one legal question is `is_live`.
@@ -99,13 +99,28 @@ type Roots = *extern(*Heap) -> unit
 //
 // A `Kind` must outlive every object naming it and its address must not move, so module storage or a
 // static is what it is for.
+//
+// **The layout is public and frozen for 0.3.x: four pointer-sized hooks, in this order.** A client
+// may begin its own per-type descriptor with a `Kind` and carry whatever it likes after it -- a
+// variant tag, a field count, a name -- and hand `alloc` the address of that descriptor. `kind_of`
+// then answers the descriptor itself, and compiled code may load it straight from `p - KIND_BACK`.
 struct Kind
     trace: Tracer
     finalize: Finalizer
     weaken: Weaker
     ephemeron: Ephemeron
 
-// Three words, a size and three flags, ahead of every object.
+// How far before a payload its `*Kind` sits: two words, 16 bytes on a 64-bit target and 8 on a
+// 32-bit one. **Frozen for 0.3.x**, so that a client may read an object's kind with one load of its
+// own -- the `kind_of` below, or inline in generated code.
+//
+// The word at `p - KIND_BACK + sizeof(usize)` is the collector's, and no client reads it. A client
+// that builds an object outside the arena -- a constant in its data segment -- lays out the same
+// two words ahead of its payload, a `*Kind` and then a word it leaves zero, and `kind_of` answers
+// for it exactly as for a heap object. That kind word is the one header word a client may forge.
+const KIND_BACK: usize = 2 * sizeof(usize)
+
+// The header ahead of every object: two links, three flags, a kind and a size.
 //
 // `gray` is the worklist link rather than a second edge in the graph, so the mark phase costs no
 // storage of its own -- an object is on the worklist or it is not, and it is threaded through the
@@ -115,14 +130,19 @@ struct Kind
 // end to end: every byte the bump pointer has ever handed out belongs to exactly one block whose
 // header says how long it is, so `base + 0` and every header after it tile the used part of the
 // block. That is the property the sweep's merge pass reads, and nothing else here needs it.
+//
+// **`kind` and `size` are the last two words before the payload**, which is what `KIND_BACK` and the
+// `@assert` under this struct promise; the rest of the header is private and may be repacked.
 private struct Header
     next: *Header
     gray: *Header
-    kind: *Kind
-    size: usize
     marked: bool
     queued: bool
     free: bool
+    kind: *Kind
+    size: usize
+
+@assert(sizeof(Header) - offsetof(Header, kind) == KIND_BACK, "a payload's kind is KIND_BACK before it")
 
 // The four constants below are module-visible rather than file-private because `tests.sysl` holds a
 // reference implementation of `bin_of` and checks the two agree at every size. A reference written
@@ -171,6 +191,7 @@ private const USIZE_BITS: u32 = 8 * u32(sizeof(usize))
 struct Heap
     private base: *u8
     private cap: usize
+    private ctx: *u8
     private bump: usize
     private all: *Header
     private bins: [NBINS]*Header
@@ -503,12 +524,34 @@ private header_of(p: *u8) -> *Header = ptr_cast(usize(p) - sizeof(Header))
 // Those bytes come out of `cap`; an arena no bigger than `lead` holds nothing and refuses every
 // allocation. A `cap` within a header and a grain of the whole `usize` range is cut to that, which
 // is what lets `take` refuse an oversized request with a single compare and no risk of wrap.
-heap(base: *u8, cap: usize) -> Heap
+//
+// `ctx` is the client's own state -- an interpreter's `Vm`, a runtime's shared tables -- held for the
+// hooks to read back with `context`. It is per heap: one heap, one context, whatever thread is
+// running. The collector never reads through it, and `null` is a fine value for a client that keeps
+// no context or finds its state some other way.
+//
+// Making a heap is constant work and touches no byte of `base`, however large `cap` is.
+heap(base: *u8, cap: usize, ctx: *u8) -> Heap
     val lead = (GRAIN - (usize(base) + sizeof(Header)) % GRAIN) % GRAIN
     val most = ~0usize - sizeof(Header) - (GRAIN - 1)
     val left = if cap > lead then cap - lead else 0
     val room = if left > most then most else left
-    Heap(&base[lead], room, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
+    Heap(&base[lead], room, ctx, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
+
+// The `ctx` this heap was made with. One load, for a hook that needs the client's state.
+@inline
+context(h: *Heap) -> *u8 = h.ctx
+
+// The `Kind` an object was allocated with: one load, `KIND_BACK` bytes before the payload.
+//
+// **It answers whatever address `alloc` was handed**, so a client whose descriptors begin with a
+// `Kind` gets its descriptor back and may cast it to its own type. It is valid on every payload of
+// this heap's live objects, and on any address the client laid out the same way outside the arena --
+// see `KIND_BACK`. The heap is not consulted, so it is not an argument.
+@inline
+kind_of(p: *u8) -> *Kind
+    val w: **Kind = ptr_cast(usize(p) - KIND_BACK)
+    w[0]
 
 // Storage for one object of `kind`, zeroed, for the caller to initialize.
 //
@@ -567,6 +610,12 @@ private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
     // at most `cap` long, so none is big enough, and the bump check below fails for it.
     if size > h.cap then return null
 
+    // A kind with no tracer would be called at the next collection; under `checks` it stops here,
+    // at the allocation that named it, instead.
+    if option_checks
+        if kind == null then trap()
+        if kind.trace == null then trap()
+
     val need = align_up(size + sizeof(Header))
 
     val want = bin_of(need)
@@ -620,6 +669,7 @@ end take
 // This is the only function a `Tracer` needs, and the only one it may call.
 mark(h: *Heap, p: *u8)
     if p == null then return
+    if option_checks then check_object(h, p)
     var o = header_of(p)
     if o.marked then return
     o.marked = true
@@ -635,6 +685,7 @@ mark(h: *Heap, p: *u8)
 // answer, which is `false` for everything, since a sweep clears the marks it leaves behind.
 is_live(h: *Heap, p: *u8) -> bool
     if p == null then return false
+    if option_checks then check_object(h, p)
     header_of(p).marked
 
 private drain(h: *Heap)
@@ -643,6 +694,56 @@ private drain(h: *Heap)
         h.graylist = o.gray
         o.queued = false
         o.kind.trace(payload_of(o), h)
+
+// What `checks` asks of every pointer handed to `mark`: that it is the payload of a live object of
+// this heap. Each failure is a trap, at the mark that was handed the bad pointer rather than at the
+// sweep that would otherwise trip over what the mark wrote.
+//
+// A payload lies between the first header's end and the bump pointer, the far end included -- a
+// zero-byte object at the top of the used part has its payload exactly there.
+private check_object(h: *Heap, p: *u8)
+    val off = usize(p) -% usize(h.base)
+
+    if off < sizeof(Header) || off > h.bump then trap()
+    if usize(p) % GRAIN != 0 then trap()
+
+    val o = header_of(p)
+
+    if o.free then trap()
+    if o.size < min_block() || o.size % GRAIN != 0 then trap()
+
+// What `checks` asks of the heap after every sweep and every `dispose`: the blocks tile the used part
+// exactly, no two free blocks are neighbours, every free block is on the bin for its size, every bin
+// holds only free blocks of its class, and the class mask says which bins have one.
+private check_heap(h: *Heap)
+    var off: usize = 0
+    var free_blocks: usize = 0
+    var last_free = false
+
+    while off < h.bump
+        val o: *Header = ptr_cast(usize(h.base) + off)
+
+        if o.size < min_block() || o.size % GRAIN != 0 || o.size > h.bump - off then trap()
+        if o.free
+            if last_free then trap()
+            free_blocks += 1
+        last_free = o.free
+        off += o.size
+
+    if off != h.bump then trap()
+
+    var binned: usize = 0
+
+    for b in 0..<NBINS
+        if bin_bit(h, b) != (h.bins[b] != null) then trap()
+        var f = h.bins[b]
+        while f != null
+            if !f.free || bin_of(f.size) != b then trap()
+            binned += 1
+            f = f.next
+
+    if binned != free_blocks then trap()
+end check_heap
 
 // Grey the roots, settle what is reachable, clear dead weak slots, then free what was not reached.
 //
@@ -735,7 +836,7 @@ private sweep(h: *Heap)
         else
             if !o.free
                 val k = o.kind
-                if k.finalize != null then k.finalize(payload_of(o))
+                if k.finalize != null then k.finalize(payload_of(o), h)
                 if counted
                     if k.weaken != null then h.weakeners -= 1
                     if k.ephemeron != null then h.ephemerals -= 1
@@ -749,6 +850,7 @@ private sweep(h: *Heap)
 
     if tail != null then tail.next = null
     if run > 0 then close_run(h, start, run)
+    if option_checks then check_heap(h)
 end sweep
 
 // Finalize and free every object, live or not, leaving an empty heap over the same block.
@@ -761,7 +863,7 @@ dispose(h: *Heap)
     while p != null
         val nxt = p.next
         if p.kind.finalize != null
-            p.kind.finalize(payload_of(p))
+            p.kind.finalize(payload_of(p), h)
         p.free = true
         p = nxt
     h.all = null
@@ -771,6 +873,7 @@ dispose(h: *Heap)
     h.weakeners = 0
     h.ephemerals = 0
     rebuild_free(h)
+    if option_checks then check_heap(h)
 
 // How many objects are live as of the last sweep.
 live(h: *Heap) -> usize = h.live
