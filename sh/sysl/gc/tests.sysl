@@ -2476,3 +2476,136 @@ ephemeron_remark_is_a_no_op()
     assert_eq(live(&h), 3)
     root_a = null
     root_b = null
+
+// -- mark's range test -----------------------------------------------------------------------------
+//
+// These run with `checks` off and on alike: an address outside the arena is legal either way. What
+// the option changes is only whether `foreign_marks` counts it.
+
+// What `foreign_marks` should read after `n` out-of-arena marks: `n` under checks, zero without.
+private foreign_expected(n: usize) -> usize = if option_checks then n else 0
+
+@test("mark ignores null, is_live answers false for it, and neither counts it as foreign")
+mark_ignores_null()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    new_obj(&h, 1)
+
+    mark(&h, null)
+    assert(!is_live(&h, null))
+    assert_eq(foreign_marks(&h), 0, "null is not a foreign pointer")
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0)
+    assert_eq(foreign_marks(&h), 0)
+
+@test("a constant outside the arena with a forged kind passes through mark, is_live and kind_of untouched")
+forged_constant_through_mark()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+    val o = new_obj(&h, 1)
+    val f = forged_payload()
+
+    // A heap object pointing at the constant, and the constant as a root of its own.
+    o.props[0] = f
+    root_a = ptr_cast(o)
+    root_b = f
+    collect(&h, &roots_ab)
+
+    assert_eq(live(&h), 1, "the heap object survives; the constant is not counted as one")
+    assert(kind_of(f) == &obj_kind, "its kind word is as the client wrote it")
+    assert_eq(forged.word, 0, "and the word after it was not touched: no mark was written")
+    assert_eq(forged.value.tag, 7)
+    assert(is_live(&h, f), "a constant is always live")
+    assert_eq(foreign_marks(&h), foreign_expected(2), "reached twice: from the root and from the object")
+
+    root_a = null
+    root_b = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0)
+    assert_eq(forged.word, 0, "a sweep does not reach it either")
+
+@test("a weak reference to a constant is never cleared")
+weak_ref_to_a_constant_stays()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+    val w = new_weakref(&h, forged_payload())
+
+    root_a = ptr_cast(w)
+    collect(&h, &roots_ab)
+    assert(w.target == forged_payload(), "is_live answers true for a constant, so the weaker leaves it")
+    collect(&h, &roots_ab)
+    assert(w.target == forged_payload())
+    root_a = null
+
+@test("mark ignores the arena's base, the addresses around its used part, and everything past it")
+mark_ignores_addresses_at_the_arena_edges()
+    var block = fresh(4096 + 64)
+    var h = heap(&block[32], 4096, null)
+    val base = arena_base(&h)
+    val a = new_obj(&h, 1)
+    val b = new_obj(&h, 2)
+    val top = used(&h)
+
+    // The base is never a payload -- the first payload is a header past it -- and nothing before it,
+    // or at or after one header past the used part, can be an object's payload either.
+    val strays: [6]*u8 = [base, &base[top + block_length(0)], &base[top + 512], &base[arena_room(&h)], &block[0], &block[16]]
+
+    for s in strays
+        mark(&h, s)
+        assert(is_live(&h, s), "an address outside the objects is live: it is not the collector's")
+    assert_eq(foreign_marks(&h), foreign_expected(6))
+
+    assert(!block_marked(ptr_cast(a)) && !block_marked(ptr_cast(b)), "no stray mark touched an object")
+    assert_eq(used(&h), top)
+
+    root_a = ptr_cast(b)
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1, "and the heap collects as if the strays were never marked")
+    assert_eq(ptr_cast[*Obj](root_a).tag, 2)
+    root_a = null
+end mark_ignores_addresses_at_the_arena_edges
+
+@test("a zero-byte object at the top of the used part is marked: its payload is the used part's end")
+zero_byte_object_at_the_top_is_in_range()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    new_obj(&h, 1)
+    val z = alloc(&h, 0, &leaf_kind)
+
+    assert(z == &arena_base(&h)[used(&h)], "its payload is one past the last used byte")
+    root_a = z
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1, "it survives, so mark took it as an object")
+    assert_eq(foreign_marks(&h), 0)
+    assert(!block_free(z))
+    root_a = null
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 0)
+
+@test("foreign_marks counts each out-of-arena mark under checks and stays zero without")
+foreign_marks_is_a_stat()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    var other_block = fresh(4096)
+    var other = heap(&other_block[0], 4096, null)
+    val theirs: *u8 = ptr_cast(new_obj(&other, 1))
+    val ours: *u8 = ptr_cast(new_obj(&h, 2))
+
+    assert_eq(foreign_marks(&h), 0, "a new heap has counted nothing")
+    for i in 0..<5
+        mark(&h, theirs)
+    mark(&h, ours)
+    mark(&h, null)
+    assert_eq(foreign_marks(&h), foreign_expected(5), "another heap's object is foreign to this one; ours and null are not")
+    assert_eq(foreign_marks(&other), 0, "and the other heap counted nothing")
+    assert(!block_marked(theirs), "the other heap's object was not marked")
+    assert(block_marked(ours))
+
+    collect(&h, &no_roots)
+    assert_eq(foreign_marks(&h), foreign_expected(5), "a collection does not reset it")
+    dispose(&h)
+    assert_eq(foreign_marks(&h), foreign_expected(5), "nor does dispose: it counts since the heap was made")
+end foreign_marks_is_a_stat

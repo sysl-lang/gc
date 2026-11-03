@@ -231,6 +231,43 @@ var p = gc.alloc(h, size, &d.kind)
 One tracer then serves every type, reading what to trace from the descriptor, and a `match` on a
 variant reads its tag through the same load.
 
+## Pointers outside the arena, and constants a client builds
+
+**`mark` ignores any pointer that is not into the arena's used part**: `null`, an address below the
+arena, an address past what has been handed out, another heap's object. It reads nothing for one —
+not even the two words before it — so a tracer may hand `mark` every field it holds without asking
+which are heap objects. `is_live` answers `false` for `null` and **`true` for any other pointer
+outside the arena**, because the collector does not own it and it never dies; a weak slot holding one
+is never cleared.
+
+The test is one subtraction and one compare: the header's offset from the arena's base, computed with
+wrap, against the bump pointer. An address below the base, `null` among them, wraps to far above it.
+The payload of a zero-byte object at the very top of the used part is the used part's end, and that
+is in range.
+
+**That is what lets a client keep constant objects outside the heap**, in its data segment, and mix
+them freely with heap objects. The contract:
+
+- **`kind_of(p)` is valid on any `p` whose `p - KIND_BACK` word holds a `*Kind`**, inside the arena
+  or out. A client constant is laid out with a 16-byte prefix (8 on a 32-bit target) ahead of its
+  payload: the `*Kind` (or a descriptor beginning with one), then a word the client leaves `0`.
+- **The kind word is the only header word a client may forge.** For a `p` outside the arena, gc
+  never reads that word or the word after it, and never writes anything there.
+- `mark` and `is_live` take such a `p` as above: ignored, and live.
+
+```sysl
+struct Constant
+    kind: *gc.Kind
+    word: usize            // the collector's; left 0
+    value: Box
+
+var one: Constant = Constant(&box_descriptor.kind, 0, Box(1))
+val p: *u8 = ptr_cast(&one.value)    // gc.kind_of(p) == &box_descriptor.kind; gc.mark(h, p) is a no-op
+```
+
+A pointer *into* the arena that is not an object's payload — into the middle of one, or at a freed
+block — is still not a legal argument; the `checks` option traps on it.
+
 ## Checks
 
 ```hocon
@@ -245,6 +282,11 @@ The `checks` option (default `false`) validates the heap as it runs and traps on
 - after every sweep and every `dispose`: the blocks tile the used part of the arena exactly, no two
   free blocks are neighbours, every free block is on the bin for its size and every bin holds only
   its own class, and the class mask agrees with the bins.
+
+With checks on, **`foreign_marks(h)`** also counts the non-null pointers outside the arena `mark` has
+been handed since the heap was made. It is a statistic, never a trap: a client with no constants
+outside the heap expects it to read zero, and a client with some can see how many marks they cost.
+With checks off it is not kept and reads zero.
 
 **Off, it costs nothing.** Every guarded site is `if option_checks then …` over a constant, so at
 `false` the code is not compiled at all. The traps are `trap()`, which needs no capability, so a
@@ -444,9 +486,32 @@ interface.
   null)`, or the client's state where its hooks want `gc.context(h)`.
 - **A `Finalizer` is handed the heap.** `finalize_x(p: *u8)` becomes `finalize_x(p: *u8, h:
   *gc.Heap)`; a finalizer that has no use for it ignores it.
-- **New, and needing no change:** `context`, `kind_of`, `KIND_BACK` and the `checks` option. A
-  client that kept a descriptor pointer in its payload's first word can move it into a `Kind`-first
-  descriptor and read it with `kind_of`, which saves the word in every object.
+- **`mark` ignores pointers outside the arena, and `is_live` answers `true` for them** (still
+  `false` for `null`). A client that only ever marks `null` and its own heap objects sees no
+  difference; one that guarded `mark` with its own range test can drop it.
+- **Every object is 16 bytes smaller** where its payload is a multiple of 16 or more than 8 bytes past
+  one: the header is four words instead of five. Nothing about the header is visible except
+  `KIND_BACK`.
+- **New, and needing no change:** `context`, `kind_of`, `KIND_BACK`, the `checks` option and
+  `foreign_marks`. A client that kept a descriptor pointer in its payload's first word can move it
+  into a `Kind`-first descriptor and read it with `kind_of`, which saves the word in every object.
+
+The block a consumer writes:
+
+```hocon
+dependencies {
+  gc { git = "github.com/sysl-lang/gc", version = "0.3.0" }
+}
+```
+
+## Threads
+
+A heap is one piece of shared state: its context, its counters, its bins and its object list. A
+client that allocates from several threads serializes `alloc` with its own lock and stops the world
+for `collect`, which runs on one thread. The context is per heap, not per thread. Every counter —
+`live`, `live_size`, `weak_objects`, `ephemeron_objects`, `alloc_steps` — is updated by the
+allocation or the sweep that changes it, so each is exact whenever no `alloc` or `collect` is
+running.
 
 ## Tests
 
@@ -460,7 +525,7 @@ The suite runs both ways. With `checks` off the tests that exist to see a check 
 plain run reports what it did not exercise rather than passing them unearned; with it on they run,
 and every other test runs with the heap validated after every sweep.
 
-44 of them, and the ones that matter most are checked by falsification rather than by passing: with
+The ones that matter most are checked by falsification rather than by passing: with
 the weak map's values marked strongly instead of through the ephemeron hook,
 `ephemeron_dead_key_drops_entry` and `ephemeron_self_reference_is_collected` both fail, and
 `alloc_does_not_walk_the_whole_free_list` was written against 0.2.2's allocator and failed there
@@ -475,3 +540,12 @@ because no request can reach a 16-byte class or an 8 GB one.
 
 The seven that came with the weak-pass counts are checked the same way: with both passes forced off,
 ten tests fail, every weak-reference and weak-map test among them.
+
+So are the header and the range test. With `mark` pushing an object whatever its mark bit says, the
+traced-once tests fail (a self-cycle, a node with two parents, an ephemeron's re-mark); with the range
+test reduced to a `null` check, the constant, the weak-reference-to-a-constant, the arena-edge and the
+`foreign_marks` tests fail; and with the range measured from the payload rather than the header, the
+arena's base is taken for an object and a zero-byte object at the top is not. Each `checks` trap
+test fails with the check it exercises removed, except the `null`-kind one: an allocation naming no
+kind stops on the null load without the check too, and the check only moves the stop to before any
+heap state has changed.

@@ -250,6 +250,10 @@ struct Heap
     // with a count and not with a clock.
     private weak_walks: usize
 
+    // How many non-null pointers outside the arena `mark` has been handed. Counted only under
+    // `checks`; with it off the increment is not compiled and this stays zero.
+    private foreign: usize
+
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
 
 // Record that bin `b` has a block on it.
@@ -325,6 +329,7 @@ private[gc] block_marked(p: *u8) -> bool = header_of(p).word & MARKED != 0
 private[gc] block_free(p: *u8) -> bool = is_free(header_of(p))
 private[gc] block_length(size: usize) -> usize = align_up(size + sizeof(Header))
 private[gc] arena_room(h: *Heap) -> usize = h.cap
+private[gc] arena_base(h: *Heap) -> *u8 = h.base
 
 // The smallest block that can hold a header, which is the smallest thing a split may leave behind.
 private min_block() -> usize = align_up(sizeof(Header))
@@ -552,7 +557,7 @@ heap(base: *u8, cap: usize, ctx: *u8) -> Heap
     val most = ~0usize - sizeof(Header) - (GRAIN - 1)
     val left = if cap > lead then cap - lead else 0
     val room = if left > most then most else left
-    Heap(&base[lead], room, ctx, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0)
+    Heap(&base[lead], room, ctx, 0, null, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0, 0)
 
 // The `ctx` this heap was made with. One load, for a hook that needs the client's state.
 @inline
@@ -679,14 +684,35 @@ private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
     hand_out(h, f, kind, size, clear)
 end take
 
-// Grey one object: a `null` and an object already seen are both ignored, so a tracer may pass
-// anything it holds without checking first.
+// Whether `p`'s header would lie outside the part of the arena that holds blocks -- which is to say
+// `p` is not an object of this heap. `null`, every address below the arena and every address past
+// its used part all answer `true`.
+//
+// **One subtraction and one compare cover every case**, because the header's offset from `base` is
+// computed with wrap: an address below `base`, `null` among them, wraps to far above `bump`. The
+// payloads of this heap's objects lie in `[base + header, base + bump]` -- the far end included, for a
+// zero-byte object at the top -- so their headers lie in `[base, base + bump)`. A pointer into the
+// arena that is not a payload (an interior pointer) passes the test and is not a legal argument.
+@inline
+private outside(h: *Heap, o: *Header) -> bool = usize(o) -% usize(h.base) >= h.bump
+
+// Grey one object. A tracer may pass anything it holds without checking first: an object already
+// seen is ignored, and so is any pointer that is not into this heap's arena -- `null`, and a client's
+// constant laid out outside the arena (see `KIND_BACK`). For such a pointer nothing is read, not
+// even the two words before it.
+//
+// Under `checks` each non-null pointer ignored that way is counted by `foreign_marks`, and a pointer
+// into the arena must be the payload of a live object or the mark traps.
 //
 // This is the only function a `Tracer` needs, and the only one it may call.
+@inline
 mark(h: *Heap, p: *u8)
-    if p == null then return
+    var o: *Header = ptr_cast(usize(p) -% sizeof(Header))
+    if outside(h, o)
+        if option_checks
+            if p != null then h.foreign += 1
+        return
     if option_checks then check_object(h, p)
-    var o = header_of(p)
     val w = o.word
     if w & MARKED != 0 then return
     o.word = w | MARKED
@@ -698,10 +724,14 @@ mark(h: *Heap, p: *u8)
 // **It is meaningful only from inside a `Weaker` or an `Ephemeron`**, which is where marking is
 // finished or is between passes. Asked at any other time it reports the previous collection's
 // answer, which is `false` for everything, since a sweep clears the marks it leaves behind.
+//
+// `null` answers `false`. **Any other pointer outside the arena answers `true`**: it is a constant the
+// collector does not own, so it never dies, and a weak slot holding one is never cleared.
 is_live(h: *Heap, p: *u8) -> bool
-    if p == null then return false
+    val o: *Header = ptr_cast(usize(p) -% sizeof(Header))
+    if outside(h, o) then return p != null
     if option_checks then check_object(h, p)
-    header_of(p).word & MARKED != 0
+    o.word & MARKED != 0
 
 private drain(h: *Heap)
     while h.graylist != null
@@ -709,16 +739,11 @@ private drain(h: *Heap)
         h.graylist = o.gray
         o.kind.trace(payload_of(o), h)
 
-// What `checks` asks of every pointer handed to `mark`: that it is the payload of a live object of
-// this heap. Each failure is a trap, at the mark that was handed the bad pointer rather than at the
-// sweep that would otherwise trip over what the mark wrote.
-//
-// A payload lies between the first header's end and the bump pointer, the far end included -- a
-// zero-byte object at the top of the used part has its payload exactly there.
+// What `checks` asks of every pointer into the arena handed to `mark` or `is_live`: that it is the
+// payload of a live object of this heap. Each failure is a trap, at the mark that was handed the bad
+// pointer rather than at the sweep that would otherwise trip over what the mark wrote. A pointer
+// outside the arena never reaches here -- `outside` has already turned it away.
 private check_object(h: *Heap, p: *u8)
-    val off = usize(p) -% usize(h.base)
-
-    if off < sizeof(Header) || off > h.bump then trap()
     if usize(p) % GRAIN != 0 then trap()
 
     val o = header_of(p)
@@ -936,3 +961,11 @@ used(h: *Heap) -> usize = h.bump
 // proportional to how much the heap has freed. A first-fit walk over one list is the second kind and
 // reads as a performance mystery in the client; a counter makes it a failing assertion here instead.
 alloc_steps(h: *Heap) -> usize = h.steps
+
+// How many non-null pointers outside the arena `mark` has been handed since the heap was made.
+//
+// **A statistic, never a trap**, and counted only with the `checks` option on: with it off the count is
+// not kept and this answers zero. A client that holds no constants outside the arena expects zero
+// here, so a count above it in a checked build says a tracer handed `mark` something that was never
+// this heap's object.
+foreign_marks(h: *Heap) -> usize = h.foreign
