@@ -68,14 +68,12 @@ new, empty one into the payload. Nothing ever releases that one: the next `alloc
 it. That is one leaked core per swept object. `x.release()` gives the core back and leaves nothing
 behind. A `string` may be emptied with `x = ""`, because a literal is never allocated.
 
-**The zeroing is what makes that true, and until 0.2.1 it was not done.** Assigning a `string`, a
-`Buf` or a `Map` in sysl *releases the previous occupant*, so the client's first write into a payload
-releases whatever bytes were already there — a dead object's on a reused block, the allocator's
-leavings on a `malloc`ed heap. The release lands on something that is not a live reference and the
-process takes a bus error later, inside a tracer or a finaliser, a long way from the assignment that
-caused it. `sysl-lang/slate` hit exactly this: a crash in its own `mark_map` on roughly one run in
-three, which survived at all only because its heap is a zeroed static and so only the free-list path
-was ever dirty.
+**The zeroing is what makes that true.** Assigning a `string`, a `Buf` or a `Map` in sysl *releases
+the previous occupant*, so the client's first write into a payload releases whatever bytes were
+already there — a dead object's on a reused block, the allocator's leavings on a `malloc`ed heap.
+Without the zeroing the release lands on something that is not a live reference and the process
+takes a bus error later, inside a tracer or a finaliser, a long way from the assignment that caused
+it.
 
 **A counted box `&T` is NOT fine, and the failure is a segfault rather than a diagnostic.**
 
@@ -102,9 +100,9 @@ each. `sysl-lang/slate` does this for its function bodies.
 ## `alloc_raw`, for a constructor that writes every byte anyway
 
 `alloc` zeroes the payload and a client's constructor then overwrites it, which is the same bytes
-written twice. `sysl-lang/slate`'s profile made that visible: `memset` plus `__bzero` was 1.87% of
-its whole run, and `new_object` did not appear under its own name at all — the zeroing *is* what a
-construction costs outside `alloc`. So, since 0.2.5:
+written twice: in an interpreter's profile `memset` plus `__bzero` was 1.87% of the whole run, and the
+object constructor did not appear under its own name at all — the zeroing *is* what a construction
+costs outside `alloc`. So:
 
 ```sysl
 var o: *Obj = ptr_cast(gc.alloc_raw(h, sizeof(Obj), &obj_kind))
@@ -113,7 +111,7 @@ for i in 0..<4
     o.props[i] = null        // every byte, before the next allocation
 ```
 
-Everything `alloc` does, `alloc_raw` does — the class, the split, the object list, the accounting,
+Everything `alloc` does, `alloc_raw` does — the class, the split, the accounting,
 `null` on a full heap — except clearing the bytes. **What the caller takes on in exchange is two
 things, and the first is not the obvious one:**
 
@@ -164,18 +162,20 @@ nothing else holds would be freed while its key is still in use. The answer is n
 marked *because* its key was marked, so marking must run again afterwards, since that value may be
 some other entry's key. `collect` loops the hook and the worklist until a pass changes nothing.
 
-**Since 0.2.6 each of those two passes runs only where a live object's kind has its hook.** Both are a
-walk of the whole object list, live and dead, and for a program holding no weak value they found
-nothing on every object of every collection. The heap counts the live objects whose kind carries a
-`weaken` and those carrying an `ephemeron` — raised as an object is handed out, lowered as the sweep
-frees one, zeroed by `dispose` — and a pass whose count is zero is not run. At one or more it runs
-exactly as it always did. `weak_objects`, `ephemeron_objects` and `weak_walks` read the two counts and
-how many times a weak pass has walked the list, which is what the tests assert on.
+**Each of those two passes runs only where a live object's kind has its hook.** Both walk the whole
+heap in address order, live and dead, and for a program holding no weak value they would find nothing
+on every object of every collection. The heap counts the live objects whose kind carries a `weaken`
+and those carrying an `ephemeron` — raised as an object is handed out, lowered as the sweep frees
+one, zeroed by `dispose` — and a pass whose count is zero is not run. `weak_objects`,
+`ephemeron_objects` and `weak_walks` read the two counts and how many times a weak pass has walked
+the heap, which is what the tests assert on.
 
 **So a client that keeps a spare weak object alive for ever pays both passes for ever.** An
 interpreter that reserves one of each kind for an out-of-memory path should take the reserve under a
-kind without the hooks; measured in slate's `csv` benchmark, the collector went from 58 ms to 40 ms
-once its two reserves stopped counting.
+kind without the hooks; in one interpreter benchmark the collector went from 58 ms to 40 ms once its
+two reserves stopped counting.
+
+**Finalizers and weak passes run in address order**, not allocation order.
 
 `dispose` finalizes everything still live and empties the heap. Without it, a finalizer that closes a
 file or releases a `Buf` never runs for anything still reachable when the program stops.
@@ -338,7 +338,7 @@ the entire class of "the collector ran while I was holding a raw pointer in a lo
 
 ### Threshold on `live_size`, and grow it by what survived
 
-**Both halves of those two lines matter, and this README recommended the wrong number until 0.2.2.**
+**Both halves of those two lines matter.**
 
 `live_size` is the bytes currently held; `used` is the high-water mark and *never falls*, because a
 sweep returns storage to the free list rather than to the block. So `if gc.used(&h) > threshold`
@@ -401,11 +401,11 @@ chain to hold the line.
 **A collector's sweep hands back tens of thousands of blocks at a stroke, so the free list is where a
 tracing collector's allocator gets into trouble.** Searching one list for a block that fits makes an
 allocation cost what the last collection freed — which is to say it gets slowest exactly when it has
-just been given the most to work with. `sysl-lang/slate` measured it at **266 µs per allocation**
-against a heap holding 115,000 swept blocks, where the same allocations on a fresh heap cost 8 ms in
-total, and a profiler put 1,421 of 1,426 samples inside `alloc`.
+just been given the most to work with. Against a heap holding 115,000 swept
+blocks that costs **266 µs per allocation**, where the same allocations on a fresh heap cost 8 ms in
+total.
 
-Since **0.2.3** the free storage is segregated by size class instead:
+So the free storage is segregated by size class:
 
 - **Below a kilobyte, one bin per exact size**, sixteen bytes apart — the granularity every block is
   rounded to anyway. A bin holds blocks of one size, so its head either is the answer or the bin is
@@ -417,48 +417,29 @@ Since **0.2.3** the free storage is segregated by size class instead:
   class, so a freed 4 KB block does not vanish into a 32-byte object.
 - **Neighbours that are free at the end of a sweep are merged into one block.** Nothing but an
   address-ordered pass can see that two blocks are adjacent, so the sweep IS that pass: it walks the
-  block from its base to the bump pointer once, frees each unmarked object as it meets it, relinks
-  each survivor onto the object list in the order met, and closes every run of adjacent free blocks
-  into its bin.
+  block from its base to the bump pointer once, frees each unmarked object as it meets it, and
+  closes every run of adjacent free blocks into its bin.
+- **The sweep is one sequential read of each header**, in address order, with no object list to
+  chase. Per dead object what is touched is its size, its mark, its kind's `finalize` (called only
+  where it is not null), and the kind's two weak hooks only while a weak object is live at all.
+- **"Which is the next class above this one that has a block" is a bit scan**, not a walk up the
+  array. The heap carries two 64-bit words with a bit per class, set exactly when the class has a
+  block, and the search is a shift and a `trailing_zeros`.
+- **"Which class is this block" is a bit scan too**, `leading_zeros` rather than a shift loop. A heap
+  in its steady state is one big free block, so an *ordinary small* allocation splits it and pushes
+  the large remainder back, and the remainder is what the class computation runs on. The width of a
+  `usize` comes from `sizeof`, not from `count_ones() + count_zeros()`: the second is two population
+  counts of a *runtime* value, and arm64 has no scalar popcount.
 
-- **Since 0.2.7 that is one walk, not two.** The sweep used to follow the object list, which is in
-  allocation order and, once storage is being reused, scattered across the block — a dependent load
-  from wherever the next object happened to be — and then walk the block a second time to rebuild the
-  bins. Folding the first into the second leaves one sequential read of each header. Per dead object
-  what is touched is its size, its mark, its kind's `finalize` (called only where it is not null),
-  and the kind's two weak hooks only while a weak object is live at all. On 200,000 objects per
-  collection with one in ten surviving, a collection went from about 30 ns per dead object to 3–7,
-  with or without a finalizer; `sysl-lang/slate`'s collector time fell 20–25% on its
-  allocation-dense benchmarks.
-- **Since 0.2.4, "which is the next class above this one that has a block" is a bit scan**, not a
-  walk up the array. The heap carries two 64-bit words with a bit per class, set exactly when the
-  class has a block, and the search is a shift and a `trailing_zeros`.
+  **That search is the steady state rather than the exception, which is why it is worth a word of
+  storage.** A sweep coalesces neighbours into large blocks and a split hands remainders back to
+  large classes, so a program allocating small objects finds its own class empty almost every time
+  and starts climbing. Climbing 87 classes would mean 87 dependent loads per allocation.
 
-- **Since 0.2.5, "which class is this block" is a bit scan too.** Finding which power of two a size
-  falls in by shifting it right until it is one costs up to twenty-three shifts and twenty-three
-  compares; `leading_zeros` costs one instruction. It is easy to believe only a large request pays
-  for that loop, and that is the mistake: a heap in its steady state is one big free block, so an
-  *ordinary small* allocation splits it and pushes the large remainder back, and the remainder is
-  what the loop runs on. `sysl-lang/slate`'s sampled profile put that loop's `j += 1` as the single
-  hottest instruction inside `alloc`. Worth **6.7%** of an allocate-and-drop benchmark, best of five.
-
-  The width of a `usize` here comes from `sizeof`, not from `count_ones() + count_zeros()`. The
-  second is the portable spelling `sysl.slices` uses and it is correct, but it is two population
-  counts of a *runtime* value, and arm64 has no scalar popcount — written that way the rewrite came
-  out **slower** than the loop it replaced, which is the version that was measured first.
-
-  **That search is the steady state rather than the exception, which is why it was worth a word of
-  storage.** The two bullets above see to it: a sweep coalesces neighbours into large blocks and a
-  split hands remainders back to large classes, so a program allocating small objects finds its own
-  class empty almost every time and starts climbing. Climbing 87 classes meant 87 dependent loads
-  per allocation. Measured on an allocate-and-drop loop at an interpreter's shape — 20 million
-  40-byte payloads over a heap collected between rounds — 0.2.4 is **2.35× faster than 0.2.3**, best
-  of five. `sysl-lang/slate`'s profile had put 6.2% of its whole run time in that one walk.
-
-The same benchmark — sweep 115,000 × 192-byte blocks, each separated from the next by a survivor so
-that none of them can merge, then allocate 16,000 objects of a size that fits none of them — runs in
-**under 60 ms where 0.2.2 took 21.9 s** — and that whole figure includes building the 230,000
-objects and collecting over them, which the 21.9 s barely does.
+A benchmark that sweeps 115,000 × 192-byte blocks, each separated from the next by a survivor so
+that none of them can merge, then allocates 16,000 objects of a size that fits none of them, runs in
+under 60 ms, including building the 230,000 objects and collecting over them. A single free list
+searched linearly takes 21.9 s on it.
 
 `gc.alloc_steps(&h)` answers how many free blocks the allocator has examined since the heap was made.
 It exists so that this is a property a test can assert on rather than a wall-clock measurement: the
@@ -485,18 +466,17 @@ interface.
 
 ## Migrating from 0.2.10
 
-- **`heap` takes a third argument, the context.** `gc.heap(base, cap)` becomes `gc.heap(base, cap,
-  null)`, or the client's state where its hooks want `gc.context(h)`.
-- **A `Finalizer` is handed the heap.** `finalize_x(p: *u8)` becomes `finalize_x(p: *u8, h:
-  *gc.Heap)`; a finalizer that has no use for it ignores it.
-- **`mark` ignores pointers outside the arena, and `is_live` answers `true` for them** (still
-  `false` for `null`). A client that only ever marks `null` and its own heap objects sees no
-  difference; one that guarded `mark` with its own range test can drop it.
-- **Objects are smaller**: the header is three words instead of five, so most objects take 16 bytes
-  less and an 8-byte one 32 less. Nothing about the header is visible except `KIND_BACK`.
-- **New, and needing no change:** `context`, `kind_of`, `KIND_BACK`, the `checks` option and
-  `foreign_marks`. A client that kept a descriptor pointer in its payload's first word can move it
-  into a `Kind`-first descriptor and read it with `kind_of`, which saves the word in every object.
+- Change `gc.heap(base, cap)` to `gc.heap(base, cap, null)`, or pass the client's state where its
+  hooks want `gc.context(h)`.
+- Change each finalizer `finalize_x(p: *u8)` to `finalize_x(p: *u8, h: *gc.Heap)`; one that has no
+  use for the heap ignores it.
+- Do not rely on finalizers running in allocation order; they run in address order.
+- Drop a client-side range test guarding `mark`; `mark` ignores pointers outside the arena and
+  `is_live` answers `true` for them (`false` for `null`).
+- Size accounting by object: the header is 24 bytes on a 64-bit target (12 on a 32-bit one), so
+  recompute any layout or capacity that assumed the old header.
+- Optionally move a descriptor pointer kept in a payload's first word into a `Kind`-first descriptor
+  and read it with `kind_of`, which saves the word in every object.
 
 The block a consumer writes:
 
@@ -508,7 +488,7 @@ dependencies {
 
 ## Threads
 
-A heap is one piece of shared state: its context, its counters, its bins and its object list. A
+A heap is one piece of shared state: its context, its counters, and its bins. A
 client that allocates from several threads serializes `alloc` with its own lock and stops the world
 for `collect`, which runs on one thread. The context is per heap, not per thread. Every counter —
 `live`, `live_size`, `weak_objects`, `ephemeron_objects`, `alloc_steps` — is updated by the
@@ -530,17 +510,16 @@ and every other test runs with the heap validated after every sweep.
 The ones that matter most are checked by falsification rather than by passing: with
 the weak map's values marked strongly instead of through the ephemeron hook,
 `ephemeron_dead_key_drops_entry` and `ephemeron_self_reference_is_collected` both fail, and
-`alloc_does_not_walk_the_whole_free_list` was written against 0.2.2's allocator and failed there
-before the size classes existed. A test that could not have failed is not evidence.
+`alloc_does_not_walk_the_whole_free_list` fails against a single linear free list. A test that could not have failed is not evidence.
 
-The five that came with the class mask are checked the same way. `assert_mask_agrees` reads both
+The five class-mask tests are checked the same way. `assert_mask_agrees` reads both
 views of every class — the bit and the bin — and is run after each allocation, each sweep and each
 split, so a maintenance site left out of any of the five places that assign a bin fails it; the
 scan's own edges (the lowest class, the highest, and the boundary between the two words, where a
 shift by a whole word width would be undefined) are driven directly rather than through a heap,
 because no request can reach a 16-byte class or an 8 GB one.
 
-The seven that came with the weak-pass counts are checked the same way: with both passes forced off,
+The seven weak-pass-count tests are checked the same way: with both passes forced off,
 ten tests fail, every weak-reference and weak-map test among them.
 
 So are the header and the range test. With `mark` pushing an object whatever its mark bit says, the
