@@ -339,6 +339,12 @@ changes address, so a client may hold a raw `*T` to a collected object anywhere 
 struct, across a call — with no handle table and without telling the collector. A copying collector
 buys locality and pays for it by making every one of those illegal.
 
+**Every object costs a four-word header**: 32 bytes on a 64-bit target, 16 on a 32-bit one — the
+object-list link, the worklist link, the `*Kind`, and one word holding the block's length with the
+mark and free flags in its low bits. A block is the payload plus the header, rounded up to 16 bytes,
+so an 8- or 16-byte payload takes 48 bytes and a 32-byte payload 64. The header is private apart from
+`KIND_BACK`: the kind and the length word are the last two words before the payload in every layout.
+
 **The mark phase is a loop, not a recursion.** A worklist threaded through the object headers means a
 list a million long and a tree a million deep both cost O(1) stack. That is not an optimization: a
 recursive mark phase is a stack overflow waiting for a client's data to get large enough, and it is

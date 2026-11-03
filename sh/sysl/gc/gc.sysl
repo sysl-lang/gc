@@ -120,29 +120,44 @@ struct Kind
 // for it exactly as for a heap object. That kind word is the one header word a client may forge.
 const KIND_BACK: usize = 2 * sizeof(usize)
 
-// The header ahead of every object: two links, three flags, a kind and a size.
+// The header ahead of every object: four words, 32 bytes on a 64-bit target and 16 on a 32-bit one.
 //
-// `gray` is the worklist link rather than a second edge in the graph, so the mark phase costs no
-// storage of its own -- an object is on the worklist or it is not, and it is threaded through the
-// header it already has.
+// `next` links the object list, or a free block into its bin. `gray` is the worklist link rather
+// than a second edge in the graph, so the mark phase costs no storage of its own -- an object is on
+// the worklist or it is not, and it is threaded through the header it already has.
 //
-// `free` says whether this block is storage or an object, and it is what makes the block walkable
-// end to end: every byte the bump pointer has ever handed out belongs to exactly one block whose
-// header says how long it is, so `base + 0` and every header after it tile the used part of the
-// block. That is the property the sweep's merge pass reads, and nothing else here needs it.
+// `word` is the block's length with two flags in its low bits, which a length never uses because
+// every block is a multiple of `GRAIN`: `MARKED`, set by `mark` and cleared by the sweep, and `FREE`,
+// which says whether this block is storage or an object. `FREE` is what makes the arena walkable end
+// to end: every byte the bump pointer has ever handed out belongs to exactly one block whose header
+// says how long it is, so `base + 0` and every header after it tile the used part of the arena. That
+// is the property the sweep's merge pass reads. One load of `word` answers the length, the mark and
+// whether the block is free, which is all the sweep asks of a block.
 //
-// **`kind` and `size` are the last two words before the payload**, which is what `KIND_BACK` and the
+// **There is no "queued" flag, because marking is the queue's guard.** `mark` pushes an object only
+// on the edge where `MARKED` goes from clear to set, which happens once per object per collection,
+// so no object is ever on the worklist twice.
+//
+// **`kind` and `word` are the last two words before the payload**, which is what `KIND_BACK` and the
 // `@assert` under this struct promise; the rest of the header is private and may be repacked.
 private struct Header
     next: *Header
     gray: *Header
-    marked: bool
-    queued: bool
-    free: bool
     kind: *Kind
-    size: usize
+    word: usize
 
 @assert(sizeof(Header) - offsetof(Header, kind) == KIND_BACK, "a payload's kind is KIND_BACK before it")
+@assert(sizeof(Header) == 4 * sizeof(usize), "the header is four words")
+
+// The flags in a header's `word`, and the mask that leaves its length.
+private const MARKED: usize = 1
+private const FREE: usize = 2
+private const FLAGS: usize = 15
+
+@assert(FLAGS == GRAIN - 1, "the flags sit in the bits a grain-multiple length leaves clear")
+
+private size_of(o: *Header) -> usize = o.word & ~FLAGS
+private is_free(o: *Header) -> bool = o.word & FREE != 0
 
 // The four constants below are module-visible rather than file-private because `tests.sysl` holds a
 // reference implementation of `bin_of` and checks the two agree at every size. A reference written
@@ -303,6 +318,14 @@ end bin_length
 
 private[gc] class_of_request(size: usize) -> usize = bin_of(align_up(size + sizeof(Header)))
 
+// What one header says about the object at `p` -- its block's length, its mark, whether it is free --
+// and the block a request of `size` payload bytes takes, for the tests of the header's packing.
+private[gc] block_bytes(p: *u8) -> usize = size_of(header_of(p))
+private[gc] block_marked(p: *u8) -> bool = header_of(p).word & MARKED != 0
+private[gc] block_free(p: *u8) -> bool = is_free(header_of(p))
+private[gc] block_length(size: usize) -> usize = align_up(size + sizeof(Header))
+private[gc] arena_room(h: *Heap) -> usize = h.cap
+
 // The smallest block that can hold a header, which is the smallest thing a split may leave behind.
 private min_block() -> usize = align_up(sizeof(Header))
 
@@ -340,11 +363,11 @@ private[gc] bin_of(size: usize) -> usize
     SMALL_BINS + j
 end bin_of
 
-// Put a block on the list for its class.
-private push_free(h: *Heap, o: *Header)
-    val b = bin_of(o.size)
+// Make the `size` bytes at `o` one free block, and put it on the list for its class.
+private push_free(h: *Heap, o: *Header, size: usize)
+    val b = bin_of(size)
 
-    o.free = true
+    o.word = size | FREE
     o.next = h.bins[b]
     h.bins[b] = o
     bin_set(h, b)
@@ -359,7 +382,7 @@ private take_from_bin(h: *Heap, b: usize, need: usize, limit: usize) -> *Header
         h.steps += 1
         seen += 1
 
-        if f.size >= need
+        if size_of(f) >= need
             if prev == null
                 h.bins[b] = f.next
                 if f.next == null then bin_clear(h, b)
@@ -407,7 +430,7 @@ end take_larger
 // kilobyte, freed it, and then wanted a dozen small objects would answer the first one out of the
 // kilobyte and be full.
 private split(h: *Heap, o: *Header, need: usize)
-    val rest = o.size - need
+    val rest = size_of(o) - need
 
     if rest < min_block() then return
 
@@ -415,29 +438,26 @@ private split(h: *Heap, o: *Header, need: usize)
 
     t.gray = null
     t.kind = null
-    t.size = rest
-    t.marked = false
-    t.queued = false
-    o.size = need
+    o.word = need
 
-    push_free(h, t)
+    push_free(h, t, rest)
 end split
 
 // Link a block into the object list, clear the caller's bytes where it asked for that, and answer
 // the payload.
 private hand_out(h: *Heap, o: *Header, kind: *Kind, size: usize, clear: bool) -> *u8
+    val bytes = size_of(o)
+
     o.gray = null
     o.kind = kind
-    o.marked = false
-    o.queued = false
-    o.free = false
+    o.word = bytes
     o.next = h.all
     h.all = o
     h.live += 1
 
     // **The block, not what was asked for.** A block is what it is -- a reused one trimmed to fit, a
     // fresh one rounded up -- and that is what it costs the heap for as long as it is held.
-    h.live_bytes += o.size
+    h.live_bytes += bytes
 
     if kind.weaken != null then h.weakeners += 1
     if kind.ephemeron != null then h.ephemerals += 1
@@ -473,9 +493,9 @@ private rebuild_free(h: *Heap)
 
     while off < h.bump
         var o: *Header = ptr_cast(usize(h.base) + off)
-        val sz = o.size
+        val sz = size_of(o)
 
-        if o.free
+        if is_free(o)
             if run == 0 then start = off
             run += sz
         else
@@ -489,11 +509,7 @@ private rebuild_free(h: *Heap)
 end rebuild_free
 
 private close_run(h: *Heap, start: usize, run: usize)
-    var o: *Header = ptr_cast(usize(h.base) + start)
-
-    o.size = run
-
-    push_free(h, o)
+    push_free(h, ptr_cast(usize(h.base) + start), run)
 
 // Clear a fresh payload before the caller sees it.
 //
@@ -644,7 +660,7 @@ private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
         var o: *Header = ptr_cast(usize(h.base) + h.bump)
 
         h.bump += need
-        o.size = need
+        o.word = need
         return hand_out(h, o, kind, size, clear)
 
     // **The bounded search is not good enough to answer `null` on**, because a large class holds a
@@ -671,12 +687,11 @@ mark(h: *Heap, p: *u8)
     if p == null then return
     if option_checks then check_object(h, p)
     var o = header_of(p)
-    if o.marked then return
-    o.marked = true
-    if !o.queued
-        o.queued = true
-        o.gray = h.graylist
-        h.graylist = o
+    val w = o.word
+    if w & MARKED != 0 then return
+    o.word = w | MARKED
+    o.gray = h.graylist
+    h.graylist = o
 
 // Whether marking has decided this object survives the collection now running.
 //
@@ -686,13 +701,12 @@ mark(h: *Heap, p: *u8)
 is_live(h: *Heap, p: *u8) -> bool
     if p == null then return false
     if option_checks then check_object(h, p)
-    header_of(p).marked
+    header_of(p).word & MARKED != 0
 
 private drain(h: *Heap)
     while h.graylist != null
         var o = h.graylist
         h.graylist = o.gray
-        o.queued = false
         o.kind.trace(payload_of(o), h)
 
 // What `checks` asks of every pointer handed to `mark`: that it is the payload of a live object of
@@ -709,8 +723,9 @@ private check_object(h: *Heap, p: *u8)
 
     val o = header_of(p)
 
-    if o.free then trap()
-    if o.size < min_block() || o.size % GRAIN != 0 then trap()
+    if is_free(o) then trap()
+    if o.word & FLAGS & ~(MARKED | FREE) != 0 then trap()
+    if size_of(o) < min_block() then trap()
 
 // What `checks` asks of the heap after every sweep and every `dispose`: the blocks tile the used part
 // exactly, no two free blocks are neighbours, every free block is on the bin for its size, every bin
@@ -723,12 +738,15 @@ private check_heap(h: *Heap)
     while off < h.bump
         val o: *Header = ptr_cast(usize(h.base) + off)
 
-        if o.size < min_block() || o.size % GRAIN != 0 || o.size > h.bump - off then trap()
-        if o.free
+        val sz = size_of(o)
+
+        if sz < min_block() || sz > h.bump - off then trap()
+        if o.word & FLAGS & ~FREE != 0 then trap()
+        if is_free(o)
             if last_free then trap()
             free_blocks += 1
-        last_free = o.free
-        off += o.size
+        last_free = is_free(o)
+        off += sz
 
     if off != h.bump then trap()
 
@@ -738,7 +756,7 @@ private check_heap(h: *Heap)
         if bin_bit(h, b) != (h.bins[b] != null) then trap()
         var f = h.bins[b]
         while f != null
-            if !f.free || bin_of(f.size) != b then trap()
+            if !is_free(f) || bin_of(size_of(f)) != b then trap()
             binned += 1
             f = f.next
 
@@ -775,7 +793,7 @@ collect(h: *Heap, roots: Roots)
         h.weak_walks += 1
         var e = h.all
         while e != null
-            if e.marked && e.kind.ephemeron != null
+            if e.word & MARKED != 0 && e.kind.ephemeron != null
                 if e.kind.ephemeron(payload_of(e), h)
                     changed = true
             e = e.next
@@ -785,7 +803,7 @@ collect(h: *Heap, roots: Roots)
         h.weak_walks += 1
         var w = h.all
         while w != null
-            if w.marked && w.kind.weaken != null
+            if w.word & MARKED != 0 && w.kind.weaken != null
                 w.kind.weaken(payload_of(w), h)
             w = w.next
 
@@ -824,23 +842,24 @@ private sweep(h: *Heap)
 
     while off < h.bump
         var o: *Header = ptr_cast(usize(h.base) + off)
-        val sz = o.size
+        val w = o.word
+        val sz = w & ~FLAGS
 
-        if !o.free && o.marked
-            o.marked = false
+        if w & (MARKED | FREE) == MARKED
+            o.word = sz
             if tail == null then h.all = o else tail.next = o
             tail = o
             if run > 0
                 close_run(h, start, run)
                 run = 0
         else
-            if !o.free
+            if w & FREE == 0
                 val k = o.kind
                 if k.finalize != null then k.finalize(payload_of(o), h)
                 if counted
                     if k.weaken != null then h.weakeners -= 1
                     if k.ephemeron != null then h.ephemerals -= 1
-                o.free = true
+                o.word = sz | FREE
                 h.live -= 1
                 h.live_bytes -= sz
             if run == 0 then start = off
@@ -864,7 +883,7 @@ dispose(h: *Heap)
         val nxt = p.next
         if p.kind.finalize != null
             p.kind.finalize(payload_of(p), h)
-        p.free = true
+        p.word = size_of(p) | FREE
         p = nxt
     h.all = null
     h.graylist = null

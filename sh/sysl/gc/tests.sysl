@@ -2298,3 +2298,181 @@ checks_pass_a_well_formed_heap()
     dispose(&h)
     assert_eq(live(&h), 0)
     root_a = null
+
+// -- The four-word header -------------------------------------------------------------------------
+
+@test("a header is four words, so a zero-byte object costs exactly that")
+header_is_four_words()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+
+    val p = alloc(&h, 0, &obj_kind)
+    assert_eq(used(&h), 4 * sizeof(usize), "one header and nothing else")
+    assert_eq(block_bytes(p), 4 * sizeof(usize))
+    assert_eq(block_length(0), 4 * sizeof(usize))
+    assert_eq(block_length(16), 4 * sizeof(usize) + 16, "a 16-byte payload adds one grain")
+    assert_eq(block_length(17), 4 * sizeof(usize) + 32)
+
+// A kind with nothing to trace, for payloads of any length -- including ones too short to be an Obj.
+private var leaf_kind: Kind = Kind(&trace_nothing, null, null, null)
+
+@test("each block's length, mark and free flag round-trip through allocation, marking and the sweep")
+header_word_round_trips()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+    var objs: [48]*u8 = [null; 48]
+
+    for i in 0..<48
+        objs[i] = alloc(&h, i * 5, &leaf_kind)
+        assert_eq(block_bytes(objs[i]), block_length(i * 5), "a fresh block is as long as its request rounds to")
+        assert(!block_marked(objs[i]) && !block_free(objs[i]), "and neither marked nor free")
+
+    // Grey every third object by hand, as a root set would; the rest stay white.
+    for i in 0..<48
+        if i % 3 == 0 then mark(&h, objs[i])
+    for i in 0..<48
+        assert(block_marked(objs[i]) == (i % 3 == 0), "a mark sets exactly its own object's bit")
+        assert_eq(block_bytes(objs[i]), block_length(i * 5), "and leaves every length alone")
+        assert(!block_free(objs[i]))
+
+    collect(&h, &no_roots)
+    assert_eq(live(&h), 16, "the greyed third survives")
+    for i in 0..<48
+        if i % 3 == 0
+            assert(!block_marked(objs[i]), "the sweep clears a survivor's mark")
+            assert(!block_free(objs[i]))
+            assert_eq(block_bytes(objs[i]), block_length(i * 5), "and keeps its length")
+        else
+            assert(block_free(objs[i]), "a dead object's header says free")
+
+    // The survivors are still well-formed objects: a second collection marks them again from roots.
+    root_a = objs[0]
+    collect(&h, &roots_ab)
+    assert_eq(live(&h), 1)
+    assert(!block_marked(objs[0]) && !block_free(objs[0]))
+    root_a = null
+end header_word_round_trips
+
+@test("the largest block an arena allows is held, marked, swept and reused with its length intact")
+largest_block_round_trips()
+    var block = fresh(4096)
+    var h = heap(&block[0], 4096, null)
+    val top = (arena_room(&h) & ~(GRAIN - 1)) - block_length(0)
+
+    assert(alloc(&h, top + 1, &obj_kind) == null, "a byte more than the largest does not fit")
+    val p = alloc(&h, top, &obj_kind)
+    assert(p != null)
+    assert_eq(block_bytes(p), used(&h), "one block covers the whole used part")
+
+    root_a = p
+    collect(&h, &roots_ab)
+    assert_eq(live_size(&h), block_bytes(p), "kept, at its full length")
+    assert(!block_marked(p) && !block_free(p))
+
+    root_a = null
+    collect(&h, &no_roots)
+    assert_eq(live(&h), 0)
+    assert(block_free(p), "freed whole")
+    assert(alloc(&h, top, &obj_kind) == p, "and handed back whole")
+end largest_block_round_trips
+
+@test("the longest block the header word can hold is the arena's limit, and a request past it is refused")
+largest_length_the_word_holds()
+    var block = fresh(64)
+    var h = heap(&block[0], ~0usize, null)
+    val most = arena_room(&h)
+
+    // The arena is cut so that its largest request rounds to every bit of a word but the four the
+    // flags use -- exactly the longest length a header can say, with nothing to spare and no wrap.
+    assert_eq(block_length(most), ~(GRAIN - 1), "the longest length a header can hold")
+    assert_eq(block_length(most) & (GRAIN - 1), 0, "with the flag bits clear")
+    assert(alloc(&h, most + 1, &obj_kind) == null, "one byte more is refused before any arithmetic")
+    assert(alloc(&h, ~0usize, &obj_kind) == null)
+    assert_eq(used(&h), 0, "and nothing was handed out")
+end largest_length_the_word_holds
+
+// A tracer that counts its calls, so a test can tell an object was traced once and not twice.
+private var traced: int = 0
+
+private trace_counting(p: *u8, h: *Heap)
+    traced += 1
+    trace_obj(p, h)
+
+private var counting_kind: Kind = Kind(&trace_counting, null, null, null)
+
+@test("an object that points at itself is traced once")
+self_cycle_traced_once()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+    val o = new_obj_of(&h, 1, &counting_kind)
+    o.props[0] = ptr_cast(o)
+    o.props[1] = ptr_cast(o)
+
+    traced = 0
+    root_a = ptr_cast(o)
+    collect(&h, &roots_ab)
+    assert_eq(traced, 1)
+    assert_eq(live(&h), 1)
+    root_a = null
+
+@test("an object reached from two parents and from a root is traced once")
+shared_child_traced_once()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+    val a = new_obj_of(&h, 1, &counting_kind)
+    val b = new_obj_of(&h, 2, &counting_kind)
+    val c = new_obj_of(&h, 3, &counting_kind)
+    a.props[0] = ptr_cast(c)
+    b.props[2] = ptr_cast(c)
+    a.props[1] = ptr_cast(b)
+
+    traced = 0
+    root_a = ptr_cast(a)
+    root_b = ptr_cast(c)
+    collect(&h, &roots_ab)
+    assert_eq(traced, 3, "a, b and c, once each")
+    assert_eq(live(&h), 3)
+
+    traced = 0
+    collect(&h, &roots_ab)
+    assert_eq(traced, 3, "and once each again in the next collection")
+    root_a = null
+    root_b = null
+
+// An ephemeron that marks every live key's value whether or not it is already marked. Its first pass
+// answers `true`, so the collector drains the worklist after it: a value the re-mark wrongly queued
+// would be traced a second time there.
+private var remark_passes: int = 0
+
+private ephemeron_remark(p: *u8, h: *Heap) -> bool
+    var m: *WeakMap = ptr_cast(p)
+    for i in 0..<ENTRIES
+        if m.keys[i] != null && is_live(h, m.keys[i])
+            mark(h, m.vals[i])
+    remark_passes += 1
+    remark_passes == 1
+
+private var remark_kind: Kind = Kind(&trace_nothing, null, null, &ephemeron_remark)
+
+@test("an ephemeron that marks an already-marked value does not trace it twice")
+ephemeron_remark_is_a_no_op()
+    var block = fresh(65536)
+    var h = heap(&block[0], 65536, null)
+    val raw = alloc(&h, sizeof(WeakMap), &remark_kind)
+    var m: *WeakMap = ptr_cast(raw)
+    val key = new_obj_of(&h, 1, &counting_kind)
+    val value = new_obj_of(&h, 2, &counting_kind)
+    key.props[0] = ptr_cast(value)
+    m.keys[0] = ptr_cast(key)
+    m.vals[0] = ptr_cast(value)
+
+    traced = 0
+    remark_passes = 0
+    root_a = raw
+    root_b = ptr_cast(key)
+    collect(&h, &roots_ab)
+    assert_eq(remark_passes, 2, "a pass that answered true, then one that answered false")
+    assert_eq(traced, 2, "the key and its value, once each, though the ephemeron marked the value again")
+    assert_eq(live(&h), 3)
+    root_a = null
+    root_b = null
