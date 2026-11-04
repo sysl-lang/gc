@@ -280,6 +280,114 @@ chk_claim_falls_back_small()
     retire(&h, &c)
     clear_roots()
 
+// A heap whose first block is a free hole of `bytes` payload, held there by a live cell right after
+// it in `roots[0]`, and nothing else handed out. The hole's length is `block_length(bytes)`.
+private holed_heap(block: []u8, bytes: usize) -> Heap
+    var h = heap(&block[0], block.len, null)
+    assert(alloc(&h, bytes, &cell_kind) != null)
+    roots[0] = alloc(&h, sizeof(Cell), &cell_kind)
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 1)
+    h
+
+@test("retire, collect and claim around every allocation, every object kept, reuses one chunk")
+chk_claim_reuses_retired_tail()
+    // What a runtime under collect-on-every-alloc stress does. Each retire frees the chunk's tail behind
+    // one more survivor, just short of a whole chunk; a claim that passed it over would carve a fresh
+    // chunk from the bump region every round.
+    var block = arena(1048576 * 64)
+    var h = heap(&block[0], block.len, null)
+    var c = chunk()
+    val rounds: usize = 200
+
+    assert_eq(chunk_len_of(&h), 262144)
+    for i in 0..<rounds
+        retire(&h, &c)
+        collect(&h, &mark_roots)
+        var p = chunk_alloc(&c, sizeof(Cell), &cell_kind)
+        if p == null
+            assert(claim(&h, &c, sizeof(Cell)))
+            p = chunk_alloc(&c, sizeof(Cell), &cell_kind)
+        assert(p != null)
+        var o: *Cell = ptr_cast(p)
+        o.refs[0] = roots[0]
+        roots[0] = p
+
+    retire(&h, &c)
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), rounds)
+    assert_eq(live_size(&h), rounds * block_length(sizeof(Cell)))
+    assert_eq(used(&h), chunk_len_of(&h), "one chunk, not one per round")
+    clear_roots()
+
+@test("a free block just short of a whole chunk is claimed before the bump region")
+chk_claim_reuses_hole_under_a_chunk()
+    var block = arena(1048576 * 4)
+    val len = chunk_length(block.len)
+    var h = holed_heap(block, len - 64)
+    var c = chunk()
+    val hole = block_length(len - 64)
+    val high = used(&h)
+
+    assert(hole < len)
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert_eq(chunk_span(&c), hole, "the hole, taken whole")
+    assert_eq(used(&h), high, "the bump region did not move")
+    retire(&h, &c)
+    clear_roots()
+
+@test("a mid-size free block is claimed before the bump region")
+chk_claim_reuses_mid_size_hole()
+    for bytes in [8192usize, 16000, 40000, 65000]
+        var block = arena(1048576 * 16)
+        var h = holed_heap(block, bytes)
+        var c = chunk()
+        val high = used(&h)
+
+        assert(block_length(bytes) < chunk_len_of(&h))
+        assert(claim(&h, &c, sizeof(Cell)))
+        assert_eq(chunk_span(&c), block_length(bytes), "the hole, taken whole")
+        assert_eq(used(&h), high, "the bump region did not move")
+        val p = chunk_alloc(&c, sizeof(Cell), &cell_kind)
+        assert(usize(p) < usize(arena_base(&h)) + block_length(bytes), "the chunk is the hole")
+        retire(&h, &c)
+        clear_roots()
+
+@test("a free block shorter than the object and its reserve, or than CLAIM_MIN, is left for the bump region")
+chk_claim_skips_short_hole()
+    // Shorter than `fit` for an object of CHUNK_OBJECT_MAX: it cannot hold the object.
+    var block = arena(1048576 * 4)
+    var h = holed_heap(block, 1000)
+    var c = chunk()
+    val high = used(&h)
+
+    assert(block_length(1000) < block_length(CHUNK_OBJECT_MAX) + block_length(0))
+    assert(claim(&h, &c, CHUNK_OBJECT_MAX))
+    assert_eq(chunk_span(&c), chunk_len_of(&h), "a whole chunk")
+    assert_eq(used(&h), high + chunk_len_of(&h), "from the bump region")
+    assert_eq(bin_length(&h, bin_of(block_length(1000))), 1, "the hole is still on its bin")
+    retire(&h, &c)
+
+    // Long enough for the object, but under CLAIM_MIN: a thread would be back at the lock at once.
+    var block2 = arena(1048576 * 4)
+    var h2 = holed_heap(block2, 4000)
+    var d = chunk()
+    val high2 = used(&h2)
+
+    assert(block_length(4000) < CLAIM_MIN)
+    assert(claim(&h2, &d, sizeof(Cell)))
+    assert_eq(used(&h2), high2 + chunk_len_of(&h2), "from the bump region")
+    assert_eq(bin_length(&h2, bin_of(block_length(4000))), 1, "the hole is still on its bin")
+    retire(&h2, &d)
+    clear_roots()
+
+@test("claim_least is CLAIM_MIN, or a small heap's chunk length, and never less than the object's fit")
+chk_claim_least()
+    assert_eq(claim_least(262144, 64), CLAIM_MIN)
+    assert_eq(claim_least(4096, 64), 4096)
+    assert_eq(claim_least(262144, 20000), 20000)
+    assert_eq(claim_least(0, 64), 64)
+
 @test("a claim on a full heap answers false, and succeeds after every chunk is retired and the heap collected")
 chk_claim_full_then_collect()
     var block = arena(65536)

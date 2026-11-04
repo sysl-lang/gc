@@ -547,9 +547,11 @@ resume
   every caveat of `alloc_raw`), 16-byte aligned, and has the header `alloc` writes, so `kind_of`,
   `mark`, the weak passes, the sweep and `dispose` treat it like any other object. The client writes
   nothing in the header, which stays private.
-- **`claim` retires whatever the chunk held, then carves a fresh one**: from the coalesced free
-  blocks first, then from the part of the arena never handed out, then — in a fragmented heap — a
-  small chunk out of any block that holds the one object. **`false` means no block holds it**:
+- **`claim` retires whatever the chunk held, then carves a fresh one, reusing free space before the
+  arena grows**: a free block of at least a whole chunk, cut to one; else any free block of at least
+  8 KiB (or the chunk length where a small heap's is shorter), taken whole; then the part of the
+  arena never handed out; then — in a fragmented heap — a small chunk out of any block that holds
+  the one object. **`false` means no block holds it**:
   retire every chunk, collect, claim again; a second `false` is out of memory. A chunk is a
   sixty-fourth of the arena, held between 32 and 256 KiB and never longer than the arena.
 - **Every chunk is retired before `collect` and before `dispose`, and a chunk still out traps

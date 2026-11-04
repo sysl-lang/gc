@@ -721,6 +721,18 @@ const CHUNK_OBJECT_MAX: usize = 2048
 private const CHUNK_MIN: usize = 32768
 private const CHUNK_MAX: usize = 262144
 
+// The shortest free block a claim reuses before it carves from the bump region: 8 KiB, which holds
+// three objects of `CHUNK_OBJECT_MAX` with the reserve. A shorter hole would send its thread back to
+// the lock after a handful of allocations, so it waits until the bump region is spent.
+private[gc] const CLAIM_MIN: usize = 8192
+
+// The shortest free block a claim takes ahead of the bump region, for a heap of chunk length `len` and
+// an object whose block and reserve are `fit`: `CLAIM_MIN`, or the chunk length where a small heap's is
+// shorter, and never less than `fit`.
+private[gc] claim_least(len: usize, fit: usize) -> usize
+    val least = if len < CLAIM_MIN then len else CLAIM_MIN
+    if least > fit then least else fit
+
 // One thread's chunk: a run of the arena it bumps through with no lock. Make it with `chunk`; only
 // its own thread touches it, except under the client's lock with that thread stopped.
 //
@@ -741,9 +753,10 @@ chunk() -> Chunk = Chunk(0, 0, 0, 0, 0, 0)
 // Retire whatever `c` holds, then make it a fresh chunk with room for at least one object of `size`
 // payload bytes. **Called under the client's lock**: it changes the heap's free lists.
 //
-// The chunk is carved from the coalesced free blocks first -- after a collection that is where nearly
-// all the free space is -- then from the part of the arena never handed out, then from any free block
-// that fits the one object, so a fragmented heap still answers with a small chunk.
+// **Free space is reused before the arena grows.** The chunk is a free block of at least a whole chunk,
+// cut to `chunk_len`; else any free block of at least `claim_least` (8 KiB, or the object and its
+// reserve if more), taken whole; then the part of the arena never handed out; then any free block that
+// fits the one object, so a fragmented heap still answers with a small chunk.
 //
 // **`false` means no block in the heap holds the object**: retire every chunk, collect and try
 // again. It also answers `false` for a `size` above `CHUNK_OBJECT_MAX`, which no chunk serves; under
@@ -760,14 +773,24 @@ claim(h: *Heap, c: *Chunk, size: usize) -> bool
     val fit = align_up(size + sizeof(Header)) + min_block()
     val want = if h.chunk_len > fit then h.chunk_len else fit
 
-    // Every block in a class above `fit`'s fits it, so the head of the first non-empty one is taken
-    // unread, exactly as `take_larger` does for an allocation. The search starts at the class of a
-    // whole chunk, so a chunk does not eat the one block a later small chunk could have had.
-    val fit_class = bin_of(fit)
-    val whole = bin_of(h.chunk_len)
-    val below = if whole > fit_class + 1 then whole - 1 else fit_class
+    // A whole chunk first: a block of at least `want` from that length's own class, then the head of
+    // any class above it, whose every block is longer. Either is cut to `want`.
+    val whole = bin_of(want)
+    var f = take_from_bin(h, whole, want, SCAN)
 
-    var f = take_larger(h, below)
+    if f == null then f = take_larger(h, whole)
+
+    // **Then any free block of at least `CLAIM_MIN`, before the bump region.** A run just short of a
+    // chunk -- the tail `retire` frees behind a few survivors is exactly that -- would otherwise be
+    // passed over while the arena had room, and a heap that kept a few objects per chunk would grow by
+    // a chunk at every claim. A block found here is shorter than `want` unless a long one sat past the
+    // scan above, so it is taken whole, and no chunk is ever longer than `want`.
+    if f == null
+        val least = claim_least(h.chunk_len, fit)
+        val from = bin_of(least)
+
+        f = take_larger(h, from)
+        if f == null then f = take_from_bin(h, from, least, SCAN)
 
     if f != null
         if size_of(f) > want then split(h, f, want)
@@ -786,8 +809,10 @@ claim(h: *Heap, c: *Chunk, size: usize) -> bool
         open_chunk(h, c, o)
         return true
 
-    // A small chunk out of whatever still fits: the classes between the object's and a whole chunk's,
-    // then every block of the object's own class.
+    // A small chunk out of whatever still fits: any class above the object's, then every block of the
+    // object's own class.
+    val fit_class = bin_of(fit)
+
     f = take_larger(h, fit_class)
 
     if f == null then f = take_from_bin(h, fit_class, fit, h.cap)
