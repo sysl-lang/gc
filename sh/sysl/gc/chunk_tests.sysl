@@ -1,0 +1,642 @@
+module sh.sysl.gc
+@tests
+
+import sysl.raw.ptr_cast
+import sysl.sync.SpinLock
+import sysl.testing.skip
+import sysl.threads.Thread
+import sysl.threads.spawn
+
+// What chunks claim, run by `sysl test .`: a thread claims a run of the arena under a lock, hands
+// out objects from it with none, and retires it before a collection. Most of these tests are on one
+// thread -- several chunks claimed round-robin stand in for several threads, since a chunk is all a
+// thread holds -- and the last one runs real threads.
+
+private struct Cell
+    tag: int
+    refs: [2]*u8
+
+private trace_cell(p: *u8, h: *Heap)
+    val o: *Cell = ptr_cast(p)
+    mark(h, o.refs[0])
+    mark(h, o.refs[1])
+
+private trace_none(p: *u8, h: *Heap)
+    return
+
+private var cells_finalized: int = 0
+
+private finalize_cell(p: *u8, h: *Heap)
+    cells_finalized += 1
+
+// A weak reference, and a one-entry weak map whose value is live only while its key is.
+private struct CWeak
+    target: *u8
+
+private struct CPair
+    key: *u8
+    value: *u8
+
+private weaken_cweak(p: *u8, h: *Heap)
+    var w: *CWeak = ptr_cast(p)
+    if w.target != null && !is_live(h, w.target)
+        w.target = null
+
+private keep_value(p: *u8, h: *Heap) -> bool
+    val e: *CPair = ptr_cast(p)
+    if e.key != null && e.value != null && is_live(h, e.key) && !is_live(h, e.value)
+        mark(h, e.value)
+        return true
+    false
+
+private weaken_cpair(p: *u8, h: *Heap)
+    var e: *CPair = ptr_cast(p)
+    if e.key != null && !is_live(h, e.key)
+        e.key = null
+        e.value = null
+
+private var cell_kind: Kind = Kind(&trace_cell, null, null, null)
+private var final_cell_kind: Kind = Kind(&trace_cell, &finalize_cell, null, null)
+private var cweak_kind: Kind = Kind(&trace_none, null, &weaken_cweak, null)
+private var cpair_kind: Kind = Kind(&trace_none, null, &weaken_cpair, &keep_value)
+private var tracerless_kind: Kind = Kind(null, null, null, null)
+
+private const ROOTS: usize = 4
+private var roots: [ROOTS]*u8 = [null; ROOTS]
+
+private mark_roots(h: *Heap)
+    for i in 0..<ROOTS
+        mark(h, roots[i])
+
+private clear_roots()
+    for i in 0..<ROOTS
+        roots[i] = null
+
+private arena(bytes: usize) -> []u8 = [0; bytes]
+private dirty_arena(bytes: usize) -> []u8 = [255; bytes]
+
+private cell_in(c: *Chunk, tag: int, k: *Kind) -> *Cell
+    val p = chunk_alloc(c, sizeof(Cell), k)
+    assert(p != null, "the chunk has room for the cells the test makes")
+    var o: *Cell = ptr_cast(p)
+    o.tag = tag
+    o
+
+private needs_checks_on()
+    if !option_checks then skip("the checks option is off: run with --option checks=true")
+
+private needs_checks_off()
+    if option_checks then skip("under checks this request traps; the trap has its own test")
+
+// -- Claim, allocate, retire ----------------------------------------------------------------------
+
+@test("an empty chunk answers null, a claim fills it, and retire hands the counts to the heap")
+chk_claim_alloc_retire()
+    var block = arena(1048576)
+    var h = heap(&block[0], 1048576, null)
+    var c = chunk()
+
+    assert(chunk_alloc(&c, 16, &cell_kind) == null, "an empty chunk sends the thread to claim")
+    assert_eq(chunk_len_of(&h), 32768, "a heap of a megabyte gets the smallest chunk")
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert_eq(chunks_out(&h), 1)
+    assert_eq(chunk_span(&c), 32768)
+    assert_eq(used(&h), 32768, "a chunk from the untouched part raises the high-water mark by itself")
+    assert_eq(live_size(&h), 32768, "the whole chunk is charged at claim")
+    assert_eq(live(&h), 0, "the objects are counted in the chunk until it is retired")
+
+    var first: *u8 = null
+    for i in 0..<10
+        val p = chunk_alloc(&c, sizeof(Cell), &cell_kind)
+        assert(p != null)
+        assert_eq(usize(p) % GRAIN, 0, "every payload is 16-byte aligned")
+        assert(kind_of(p) == &cell_kind, "kind_of reads a chunk object's kind")
+        assert_eq(block_bytes(p), block_length(sizeof(Cell)), "the header holds the block length")
+        assert(!block_marked(p) && !block_free(p), "and no flag")
+        val o: *Cell = ptr_cast(p)
+        assert(o.tag == 0 && o.refs[0] == null && o.refs[1] == null, "the payload is zeroed")
+        if i == 0 then first = p
+        else assert_eq(usize(p) - usize(first), usize(i) * block_length(sizeof(Cell)), "objects are bumped in order")
+
+    assert_eq(live(&h), 0)
+    retire(&h, &c)
+    assert_eq(chunks_out(&h), 0)
+    assert_eq(chunk_span(&c), 0, "a retired chunk is empty")
+    assert_eq(live(&h), 10)
+    assert_eq(live_size(&h), 10 * block_length(sizeof(Cell)), "the unused tail is refunded")
+    assert_eq(used(&h), 32768, "the high-water mark never falls")
+
+    retire(&h, &c)
+    assert_eq(live(&h), 10, "retiring an empty chunk does nothing")
+    assert(chunk_alloc(&c, 16, &cell_kind) == null, "and it answers null again")
+
+@test("chunk_alloc zeroes a dirty payload and chunk_alloc_raw leaves it as it was")
+chk_zeroing()
+    var block = dirty_arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+
+    assert(claim(&h, &c, 64))
+    val raw = chunk_alloc_raw(&c, 64, &cell_kind)
+    val clean = chunk_alloc(&c, 64, &cell_kind)
+
+    for i in 0..<64
+        assert_eq(raw[i], 255, "the raw payload is the arena's bytes")
+        assert_eq(clean[i], 0, "the cleared payload is zero")
+
+    retire(&h, &c)
+    assert_eq(live(&h), 2)
+
+@test("an object of CHUNK_OBJECT_MAX fits a chunk, one byte more does not, and the end of a chunk answers null")
+chk_object_max()
+    var block = arena(1048576)
+    var h = heap(&block[0], 1048576, null)
+    var c = chunk()
+
+    assert(claim(&h, &c, CHUNK_OBJECT_MAX))
+    assert(chunk_alloc(&c, CHUNK_OBJECT_MAX + 1, &cell_kind) == null, "one byte over goes to alloc")
+    assert(chunk_alloc_raw(&c, CHUNK_OBJECT_MAX + 1, &cell_kind) == null, "raw or not")
+
+    // 32768 bytes less the reserve hold fifteen blocks of 2080, and the sixteenth is refused.
+    var n: usize = 0
+    while chunk_alloc(&c, CHUNK_OBJECT_MAX, &cell_kind) != null
+        n += 1
+    assert_eq(block_length(CHUNK_OBJECT_MAX), 2080)
+    assert_eq(n, (32768 - block_length(0)) / 2080)
+    assert(chunk_room(&c) < 2080, "the chunk is spent for an object of this size")
+    assert(chunk_alloc(&c, 16, &cell_kind) != null, "and still serves a small one from what is left")
+
+    retire(&h, &c)
+    assert_eq(live(&h), n + 1)
+
+@test("a claim for more than CHUNK_OBJECT_MAX answers false and leaves the chunk empty")
+chk_claim_oversize_is_false()
+    needs_checks_off()
+    var block = arena(1048576)
+    var h = heap(&block[0], 1048576, null)
+    var c = chunk()
+
+    assert(claim(&h, &c, 16))
+    assert(!claim(&h, &c, CHUNK_OBJECT_MAX + 1))
+    assert_eq(chunks_out(&h), 0, "the chunk held before was retired")
+    assert_eq(chunk_span(&c), 0)
+
+// -- The tail ---------------------------------------------------------------------------------------
+
+@test("the unused tail of a retired chunk is a free block the next alloc takes")
+chk_tail_is_free()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    val first: *u8 = ptr_cast(cell_in(&c, 1, &cell_kind))
+    cell_in(&c, 2, &cell_kind)
+    cell_in(&c, 3, &cell_kind)
+
+    val held = 3 * block_length(sizeof(Cell))
+    val tail = 32768 - held
+
+    retire(&h, &c)
+    assert_eq(bin_length(&h, bin_of(tail)), 1, "the tail is on the bin for its length")
+    assert(block_free(&first[held]), "and is marked free")
+    assert_eq(block_bytes(&first[held]), tail)
+
+    val p = alloc(&h, 1000, &cell_kind)
+    assert(p == &first[held], "the next allocation is carved from the tail, not from the bump region")
+    assert_eq(used(&h), 32768)
+
+@test("the reserve leaves a valid tail whatever the chunk stopped at")
+chk_tail_at_every_remainder()
+    // Objects of every grain from the smallest block up, each in a fresh chunk filled to the end:
+    // whatever is left, retire writes a free header into it and the heap stays walkable.
+    for step in 0..<20
+        var block = arena(262144)
+        var h = heap(&block[0], 262144, null)
+        var c = chunk()
+        val size = step * GRAIN
+        assert(claim(&h, &c, size))
+        var n: usize = 0
+        while chunk_alloc(&c, size, &cell_kind) != null
+            n += 1
+        assert(chunk_room(&c) < block_length(size))
+        retire(&h, &c)
+        assert_eq(live(&h), n)
+        assert_eq(live_size(&h), n * block_length(size))
+        collect(&h, &mark_roots)
+        assert_eq(live(&h), 0)
+        assert_eq(live_size(&h), 0)
+
+// -- Claim sources ----------------------------------------------------------------------------------
+
+@test("a claim after a collection is carved from the free blocks and leaves the high-water mark alone")
+chk_claim_from_a_bin()
+    var block = arena(524288)
+    var h = heap(&block[0], 524288, null)
+    var c = chunk()
+
+    alloc(&h, 100000, &cell_kind)
+    collect(&h, &mark_roots)
+    val high = used(&h)
+    assert_eq(live_size(&h), 0)
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert_eq(used(&h), high, "the chunk came from the freed block")
+    assert_eq(chunk_span(&c), 32768)
+    assert_eq(live_size(&h), 32768)
+
+    val rest = block_length(100000) - 32768
+    assert_eq(bin_length(&h, bin_of(rest)), 1, "the remainder went back to its bin")
+
+    retire(&h, &c)
+    assert_eq(live_size(&h), 0, "an unused chunk refunds all of itself")
+    collect(&h, &mark_roots)
+    assert_eq(used(&h), high)
+
+@test("a fragmented heap answers a claim with a small chunk")
+chk_claim_falls_back_small()
+    var block = arena(65536)
+    var h = heap(&block[0], 65536, null)
+    var c = chunk()
+
+    // Blocks of 3 KiB until the arena is full, every other one kept, so the holes are 3 KiB each.
+    var last: *Cell = null
+    var count = 0
+    loop
+        val p = alloc(&h, 3000, &cell_kind)
+        if p == null then break
+        if count % 2 == 0
+            val o: *Cell = ptr_cast(p)
+            if last == null then roots[0] = p else last.refs[0] = p
+            last = o
+        count += 1
+    collect(&h, &mark_roots)
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert(chunk_span(&c) < chunk_len_of(&h), "nothing as long as a whole chunk is left")
+    assert(chunk_span(&c) >= block_length(sizeof(Cell)) + block_length(0), "but the one object fits with its reserve")
+    assert(chunk_alloc(&c, sizeof(Cell), &cell_kind) != null)
+    retire(&h, &c)
+    clear_roots()
+
+@test("a claim on a full heap answers false, and succeeds after every chunk is retired and the heap collected")
+chk_claim_full_then_collect()
+    var block = arena(65536)
+    var h = heap(&block[0], 65536, null)
+    var a = chunk()
+    var b = chunk()
+    var spare = chunk()
+
+    assert(claim(&h, &a, sizeof(Cell)))
+    assert(claim(&h, &b, sizeof(Cell)))
+    while chunk_alloc(&a, sizeof(Cell), &cell_kind) != null
+        continue
+    while chunk_alloc(&b, sizeof(Cell), &cell_kind) != null
+        continue
+
+    assert(!claim(&h, &spare, sizeof(Cell)), "both chunks hold the whole arena")
+    assert_eq(chunks_out(&h), 2)
+
+    retire(&h, &a)
+    retire(&h, &b)
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 0)
+
+    assert(claim(&h, &spare, sizeof(Cell)), "the collection gave the arena back")
+    assert(chunk_alloc(&spare, sizeof(Cell), &cell_kind) != null)
+    retire(&h, &spare)
+
+// -- Small heaps ----------------------------------------------------------------------------------
+
+@test("a heap of no bytes has a chunk length of zero, and a claim on it fails cleanly")
+chk_heap_of_nothing()
+    var h = heap(null, 0, null)
+    var c = chunk()
+
+    assert_eq(chunk_len_of(&h), 0)
+    assert(!claim(&h, &c, 0))
+    assert(!claim(&h, &c, sizeof(Cell)))
+    assert_eq(chunks_out(&h), 0)
+    assert_eq(chunk_span(&c), 0)
+    assert_eq(used(&h), 0)
+    assert_eq(live_size(&h), 0)
+    collect(&h, &mark_roots)
+
+@test("a heap below 32 KiB gets a chunk no longer than itself, in whole grains")
+chk_small_heap_chunk_length()
+    for cap in [0usize, 1, 15, 16, 40, 100, 4096, 20000, 32767, 32768, 32800, 65536]
+        var block = arena(cap + 16)
+        var h = heap(&block[0], cap, null)
+        val len = chunk_len_of(&h)
+        assert(len <= arena_room(&h), "never more than the arena")
+        assert_eq(len % GRAIN, 0, "whole grains")
+        if arena_room(&h) >= 32768 then assert_eq(len, 32768)
+        else assert_eq(len, arena_room(&h) & ~(GRAIN - 1))
+
+    assert_eq(chunk_length(1048576 * 4), 65536)
+    assert_eq(chunk_length(1048576 * 64), 262144, "the largest chunk")
+
+@test("a claim from the untouched part takes what is left when that is less than a chunk, and never wraps")
+chk_bump_claim_takes_what_is_left()
+    var block = arena(20000)
+    var h = heap(&block[0], 20000, null)
+    var c = chunk()
+
+    assert(alloc(&h, 15000, &cell_kind) != null)
+    val left = (arena_room(&h) - used(&h)) & ~(GRAIN - 1)
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert_eq(chunk_span(&c), left)
+    assert(used(&h) <= arena_room(&h))
+
+    var d = chunk()
+    assert(!claim(&h, &d, sizeof(Cell)), "nothing is left, and the subtraction did not wrap into room")
+    assert(used(&h) <= arena_room(&h))
+    retire(&h, &c)
+
+@test("a heap smaller than an object and its reserve refuses the claim")
+chk_tiny_heap_refuses()
+    var block = arena(64)
+    var h = heap(&block[0], 48, null)
+    var c = chunk()
+    assert(!claim(&h, &c, 64))
+    assert(claim(&h, &c, 0) == (arena_room(&h) & ~(GRAIN - 1) >= block_length(0) * 2))
+    retire(&h, &c)
+
+// -- Collection over chunk objects ------------------------------------------------------------------
+
+@test("a collection across chunk objects keeps the reachable and finalizes the rest, interleaved")
+chk_mark_and_sweep()
+    var block = arena(1048576)
+    var h = heap(&block[0], 1048576, null)
+    var a = chunk()
+    var b = chunk()
+    cells_finalized = 0
+    clear_roots()
+
+    assert(claim(&h, &a, sizeof(Cell)))
+    assert(claim(&h, &b, sizeof(Cell)))
+
+    // Two chunks taking turns, as two threads would; every even tag is chained from a root and every
+    // odd one is garbage, so live and dead alternate within each chunk.
+    var cells: [40]*Cell = [null; 40]
+    for i in 0..<40
+        cells[i] = cell_in(if i % 4 < 2 then &a else &b, i, &final_cell_kind)
+        if i % 2 == 0
+            if i == 0 then roots[0] = ptr_cast(cells[0]) else cells[i - 2].refs[0] = ptr_cast(cells[i])
+    // A plain alloc among them, kept alive from a chunk object.
+    cells[38].refs[1] = alloc(&h, 500, &final_cell_kind)
+
+    retire(&h, &a)
+    retire(&h, &b)
+    assert_eq(live(&h), 41)
+
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 21)
+    assert_eq(cells_finalized, 20, "each dead chunk object finalized once")
+    for i in 0..<40
+        if i % 2 == 0 then assert_eq(cells[i].tag, i, "the survivors are intact")
+
+    clear_roots()
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 0)
+    assert_eq(live_size(&h), 0)
+    assert_eq(cells_finalized, 41)
+
+@test("dispose finalizes objects allocated in a chunk")
+chk_dispose_finalizes()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    cells_finalized = 0
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    for i in 0..<7
+        cell_in(&c, i, &final_cell_kind)
+    retire(&h, &c)
+    dispose(&h)
+    assert_eq(cells_finalized, 7)
+    assert_eq(live(&h), 0)
+
+@test("weak objects and ephemerons from a chunk are counted at retire, so the weak passes run")
+chk_weak_objects_counted()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    clear_roots()
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    val alive: *u8 = ptr_cast(cell_in(&c, 1, &cell_kind))
+    val doomed: *u8 = ptr_cast(cell_in(&c, 2, &cell_kind))
+
+    var keep: *CWeak = ptr_cast(chunk_alloc(&c, sizeof(CWeak), &cweak_kind))
+    var lose: *CWeak = ptr_cast(chunk_alloc(&c, sizeof(CWeak), &cweak_kind))
+    keep.target = alive
+    lose.target = doomed
+
+    var live_entry: *CPair = ptr_cast(chunk_alloc(&c, sizeof(CPair), &cpair_kind))
+    var dead_entry: *CPair = ptr_cast(chunk_alloc(&c, sizeof(CPair), &cpair_kind))
+    live_entry.key = alive
+    live_entry.value = ptr_cast(cell_in(&c, 3, &cell_kind))
+    dead_entry.key = ptr_cast(cell_in(&c, 4, &cell_kind))
+    dead_entry.value = ptr_cast(cell_in(&c, 5, &cell_kind))
+
+    assert_eq(weak_objects(&h), 0, "counted in the chunk until retire")
+    assert_eq(ephemeron_objects(&h), 0)
+    retire(&h, &c)
+    assert_eq(weak_objects(&h), 4, "two weak references and two map entries")
+    assert_eq(ephemeron_objects(&h), 2)
+
+    roots[0] = alive
+    roots[1] = ptr_cast(keep)
+    roots[2] = ptr_cast(lose)
+    roots[3] = ptr_cast(live_entry)
+    val walks = weak_walks(&h)
+    collect(&h, &mark_roots)
+
+    assert(weak_walks(&h) > walks, "the weak passes ran")
+    assert(keep.target == alive, "a live target is kept")
+    assert(lose.target == null, "a dead target's slot is cleared before its storage is freed")
+    assert(live_entry.value != null, "a live key keeps its value")
+    val kept: *Cell = ptr_cast(live_entry.value)
+    assert_eq(kept.tag, 3, "and the value's storage was not freed")
+    // alive, keep, lose, live_entry and its value
+    assert_eq(live(&h), 5)
+    assert_eq(weak_objects(&h), 3)
+    assert_eq(ephemeron_objects(&h), 1)
+    clear_roots()
+
+@test("foreign_marks stays zero for a heap of chunk objects")
+chk_no_foreign_marks()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    assert(claim(&h, &c, sizeof(Cell)))
+    val a = cell_in(&c, 1, &cell_kind)
+    a.refs[0] = ptr_cast(cell_in(&c, 2, &cell_kind))
+    retire(&h, &c)
+    roots[0] = ptr_cast(a)
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 2)
+    assert_eq(foreign_marks(&h), 0)
+    clear_roots()
+
+@test("several chunks out at once never overlap, and each refills when spent")
+chk_several_chunks_out()
+    var block = arena(1048576)
+    var h = heap(&block[0], 1048576, null)
+    var cs: [4]Chunk = [chunk(); 4]
+    var made: [4]int = [0; 4]
+    var claims: usize = 0
+
+    for i in 0..<4
+        assert(claim(&h, &cs[i], sizeof(Cell)))
+        claims += 1
+    assert_eq(chunks_out(&h), 4)
+
+    // Round-robin over the four, as four threads would, each refilling under "the lock" when spent.
+    var first: [4]*Cell = [null; 4]
+    for n in 0..<6000
+        val t = n % 4
+        var p = chunk_alloc(&cs[t], sizeof(Cell), &cell_kind)
+        if p == null
+            assert(claim(&h, &cs[t], sizeof(Cell)))
+            claims += 1
+            p = chunk_alloc(&cs[t], sizeof(Cell), &cell_kind)
+        var o: *Cell = ptr_cast(p)
+        o.tag = n
+        if made[t] == 0 then first[t] = o
+        made[t] += 1
+
+    assert(claims > 4, "each chunk was spent and claimed again")
+    assert_eq(chunks_out(&h), 4)
+    assert_eq(first[0].tag, 0, "no chunk wrote over another's objects")
+    assert_eq(first[3].tag, 3)
+
+    for i in 0..<4
+        retire(&h, &cs[i])
+    assert_eq(chunks_out(&h), 0)
+    assert_eq(live(&h), 6000)
+    assert_eq(live_size(&h), 6000 * block_length(sizeof(Cell)))
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 0)
+
+// -- Collect requires every chunk retired --------------------------------------------------------
+
+@test("collect with a chunk still out traps, with checks on or off", should_trap)
+chk_collect_with_a_chunk_out_traps()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    assert(claim(&h, &c, sizeof(Cell)))
+    cell_in(&c, 1, &cell_kind)
+    collect(&h, &mark_roots)
+
+@test("dispose with a chunk still out traps, with checks on or off", should_trap)
+chk_dispose_with_a_chunk_out_traps()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    assert(claim(&h, &c, sizeof(Cell)))
+    dispose(&h)
+
+@test("under checks, chunk_alloc naming no kind traps", should_trap)
+chk_checks_null_kind()
+    needs_checks_on()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    assert(claim(&h, &c, sizeof(Cell)))
+    chunk_alloc(&c, 16, null)
+
+@test("under checks, chunk_alloc_raw naming a kind with no tracer traps", should_trap)
+chk_checks_tracerless_kind()
+    needs_checks_on()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    assert(claim(&h, &c, sizeof(Cell)))
+    chunk_alloc_raw(&c, 16, &tracerless_kind)
+
+@test("under checks, a claim for more than CHUNK_OBJECT_MAX traps", should_trap)
+chk_checks_oversize_claim()
+    needs_checks_on()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    claim(&h, &c, CHUNK_OBJECT_MAX + 1)
+
+@test("under checks, retire traps on a chunk whose objects no longer tile it", should_trap)
+chk_checks_forged_tiling()
+    needs_checks_on()
+    var block = arena(262144)
+    var h = heap(&block[0], 262144, null)
+    var c = chunk()
+    assert(claim(&h, &c, sizeof(Cell)))
+    val p: *u8 = ptr_cast(cell_in(&c, 1, &cell_kind))
+    cell_in(&c, 2, &cell_kind)
+
+    // The length word after the kind, a grain longer: the first block now overlaps the second.
+    var size_word: *usize = ptr_cast(usize(p) - KIND_BACK + sizeof(usize))
+    size_word[0] = size_word[0] + GRAIN
+    retire(&h, &c)
+
+// -- Real threads -------------------------------------------------------------------------------
+
+private const WORKERS: usize = 4
+private const PER_WORKER: int = 5000
+
+private struct Slot
+    shared: *Shared
+    c: Chunk
+    claims: usize
+
+private struct Shared
+    h: Heap
+    lock: SpinLock
+    slots: [WORKERS]Slot
+
+// A thread's allocation loop: lock-free from its own chunk, and under the shared lock only to claim.
+private work(s: *Slot) -> unit
+    for n in 0..<PER_WORKER
+        var p = chunk_alloc(&s.c, sizeof(Cell), &cell_kind)
+        if p == null
+            s.shared.lock.lock()
+            val ok = claim(&s.shared.h, &s.c, sizeof(Cell))
+            s.shared.lock.unlock()
+            assert(ok, "the heap is big enough for every thread's cells")
+            s.claims += 1
+            p = chunk_alloc(&s.c, sizeof(Cell), &cell_kind)
+        var o: *Cell = ptr_cast(p)
+        o.tag = n
+
+@test("threads claiming under a lock and allocating without one lose nothing, and a stop-and-collect sees it all")
+chk_real_threads()
+    var block = arena(4194304)
+    val s: &Shared = Shared(heap(&block[0], 4194304, null), SpinLock(0), [Slot(null, chunk(), 0); WORKERS])
+    var threads: [WORKERS]Option[Thread] = [None; WORKERS]
+
+    for i in 0..<WORKERS
+        s.slots[i].shared = &*s
+    for i in 0..<WORKERS
+        threads[i] = spawn(&work, &s.slots[i])
+
+    for i in 0..<WORKERS
+        threads[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+
+    // The world is stopped: retire every thread's chunk, then collect.
+    var claims: usize = 0
+    for i in 0..<WORKERS
+        claims += s.slots[i].claims
+        retire(&s.h, &s.slots[i].c)
+
+    assert(claims >= WORKERS)
+    assert_eq(chunks_out(&s.h), 0)
+    assert_eq(live(&s.h), WORKERS * usize(PER_WORKER))
+    assert_eq(live_size(&s.h), WORKERS * usize(PER_WORKER) * block_length(sizeof(Cell)))
+    collect(&s.h, &mark_roots)
+    assert_eq(live(&s.h), 0)
+    assert_eq(live_size(&s.h), 0)

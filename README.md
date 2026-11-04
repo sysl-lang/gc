@@ -271,12 +271,16 @@ block — is still not a legal argument; the `checks` option traps on it.
 ## Checks
 
 ```hocon
-gc { git = "github.com/sysl-lang/gc", version = "0.3.0", options = { checks = true } }
+gc { git = "github.com/sysl-lang/gc", version = "0.3.1", options = { checks = true } }
 ```
 
 The `checks` option (default `false`) validates the heap as it runs and traps on the first fault:
 
-- `alloc` / `alloc_raw` with a `null` kind, or a kind whose `trace` is `null`;
+- `alloc` / `alloc_raw` / `chunk_alloc` / `chunk_alloc_raw` with a `null` kind, or a kind whose
+  `trace` is `null`;
+- `claim` for more than `CHUNK_OBJECT_MAX` bytes;
+- at `retire`: a chunk whose objects do not tile it from its start to where its thread stopped, or
+  whose object, weak-object and ephemeron counts disagree with what is in it;
 - `mark` / `is_live` of a pointer that is not the payload of a live object of this heap — a freed
   block, a pointer into the middle of a payload, a misaligned one;
 - after every sweep and every `dispose`: the blocks tile the used part of the arena exactly, no two
@@ -482,7 +486,7 @@ The block a consumer writes:
 
 ```hocon
 dependencies {
-  gc { git = "github.com/sysl-lang/gc", version = "0.3.0" }
+  gc { git = "github.com/sysl-lang/gc", version = "0.3.1" }
 }
 ```
 
@@ -492,8 +496,76 @@ A heap is one piece of shared state: its context, its counters, and its bins. A
 client that allocates from several threads serializes `alloc` with its own lock and stops the world
 for `collect`, which runs on one thread. The context is per heap, not per thread. Every counter —
 `live`, `live_size`, `weak_objects`, `ephemeron_objects`, `alloc_steps` — is updated by the
-allocation or the sweep that changes it, so each is exact whenever no `alloc` or `collect` is
-running.
+allocation, the retire or the sweep that changes it, so each is exact whenever no `alloc`, `claim`
+or `collect` is running **and no chunk is out**.
+
+### Chunks: allocation with no lock
+
+With eight threads allocating, a lock around every `alloc` is the program. A **chunk** takes the
+lock off the common path: a thread claims a run of the arena under the client's lock, then hands
+out objects from it by bumping a pointer, touching nothing shared.
+
+```sysl
+struct Chunk                                              // one per thread, kept by the client
+chunk() -> Chunk                                          // an empty one
+const CHUNK_OBJECT_MAX: usize = 2048                      // the largest payload a chunk serves
+claim(h: *Heap, c: *Chunk, size: usize) -> bool           // under the lock
+chunk_alloc(c: *Chunk, size: usize, kind: *Kind) -> *u8   // no lock; zeroed
+chunk_alloc_raw(c: *Chunk, size: usize, kind: *Kind) -> *u8
+retire(h: *Heap, c: *Chunk)                               // under the lock, or world stopped
+chunks_out(h: *Heap) -> usize
+```
+
+A thread's allocation:
+
+```sysl
+var p = gc.chunk_alloc(&t.chunk, size, kind)
+if p == null
+    if size > gc.CHUNK_OBJECT_MAX
+        lock(); p = gc.alloc(h, size, kind); unlock()
+    else
+        lock()
+        if !gc.claim(h, &t.chunk, size)
+            unlock(); stop_world_and_collect()
+            lock(); gc.claim(h, &t.chunk, size)
+        unlock()
+        p = gc.chunk_alloc(&t.chunk, size, kind)
+```
+
+and a collection:
+
+```
+stop the world
+for each thread t: gc.retire(h, &t.chunk)
+gc.collect(h, roots)
+resume
+```
+
+- **`chunk_alloc` answers `null`** for an empty or spent chunk and for a `size` above
+  `CHUNK_OBJECT_MAX`. It never touches the heap and takes no atomic: a compare, a bump, and the two
+  header words. Every promise of `alloc` holds — the payload is zeroed (`chunk_alloc_raw` carries
+  every caveat of `alloc_raw`), 16-byte aligned, and has the header `alloc` writes, so `kind_of`,
+  `mark`, the weak passes, the sweep and `dispose` treat it like any other object. The client writes
+  nothing in the header, which stays private.
+- **`claim` retires whatever the chunk held, then carves a fresh one**: from the coalesced free
+  blocks first, then from the part of the arena never handed out, then — in a fragmented heap — a
+  small chunk out of any block that holds the one object. **`false` means no block holds it**:
+  retire every chunk, collect, claim again; a second `false` is out of memory. A chunk is a
+  sixty-fourth of the arena, held between 32 and 256 KiB and never longer than the arena.
+- **Every chunk is retired before `collect` and before `dispose`, and a chunk still out traps
+  there**, whatever the options: the tail of an unretired chunk is bytes no walk of the arena can
+  read. Retire turns the unused tail into an ordinary free block and adds the chunk's object,
+  weak-object and ephemeron counts to the heap's, in constant time. Threads retire at exit too.
+- **`live_size` is charged a whole chunk at claim and refunded the tail at retire**, so while chunks
+  are out it over-reports by at most their unused parts: a budget fires a little early, never late.
+  `used` rises by a whole chunk carved from the untouched part.
+- **Publication.** gc's stores into a chunk object's header are plain. A client that publishes
+  objects with a release fence after construction and stops the world through a sequentially
+  consistent safepoint handshake — as avin does — has already ordered them before the collecting
+  thread reads them; gc asks nothing more.
+
+A client that never claims pays nothing: `alloc`, `alloc_raw`, `mark` and the sweep are the same
+instructions they were in 0.3.0.
 
 ## Tests
 
@@ -530,3 +602,7 @@ arena's base is taken for an object. Each `checks` trap
 test fails with the check it exercises removed, except the `null`-kind one: an allocation naming no
 kind stops on the null load without the check too, and the check only moves the stop to before any
 heap state has changed.
+
+The chunk tests (`chunk_tests.sysl`) are checked the same way: with the reserve dropped ten of them
+fail, with the weak counting dropped from `chunk_alloc` the weak-object test fails, and with the tail
+left uncredited at `retire` six `live_size` assertions fail.

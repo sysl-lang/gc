@@ -8,7 +8,7 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       gc { git = "github.com/sysl-lang/gc", version = "0.3.0" }
+//       gc { git = "github.com/sysl-lang/gc", version = "0.3.1" }
 //     }
 //
 // The coordinate names the package, `gc`; the module a program imports is `sh.sysl.gc`. The module
@@ -17,7 +17,7 @@
 
 package {
   name    = "gc"
-  version = "0.3.0"
+  version = "0.3.1"
   sysl    = "0.6.0"
 }
 
@@ -49,7 +49,7 @@ requires {
 // is `if option_checks then ...` over a constant, so at `false` -- the default -- the guarded code is
 // not compiled at all. A consumer turns it on for a debugging build:
 //
-//     gc { git = "github.com/sysl-lang/gc", version = "0.3.0", options = { checks = true } }
+//     gc { git = "github.com/sysl-lang/gc", version = "0.3.1", options = { checks = true } }
 //
 // and this package's own suite runs both ways: `sysl test .` and `sysl test . --option checks=true`.
 options {

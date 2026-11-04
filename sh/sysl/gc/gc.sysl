@@ -254,6 +254,12 @@ struct Heap
     // `checks`; with it off the increment is not compiled and this stays zero.
     private foreign: usize
 
+    // How many chunks `claim` has handed out that `retire` has not taken back, and how long a chunk
+    // is when the heap has room for a whole one. Appended after every other field, so each of those
+    // keeps its offset and the code that reads them is the same instructions it was before chunks.
+    private chunks: usize
+    private chunk_len: usize
+
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
 
 // Record that bin `b` has a block on it.
@@ -553,7 +559,20 @@ heap(base: *u8, cap: usize, ctx: *u8) -> Heap
     val most = ~0usize - sizeof(Header) - (GRAIN - 1)
     val left = if cap > lead then cap - lead else 0
     val room = if left > most then most else left
-    Heap(&base[lead], room, ctx, 0, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0, 0)
+    Heap(&base[lead], room, ctx, 0, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0, 0, 0, chunk_length(room))
+
+// How long a chunk is in an arena of `room` bytes: a sixty-fourth of it, held between 32 and 256
+// kilobytes and cut to whole grains -- and never more than the arena itself, so a small heap asks for
+// what it has rather than for a length no block could ever reach.
+//
+// **A sixty-fourth is what keeps idle chunks from holding the heap hostage.** Eight threads each
+// holding an unused chunk hold an eighth of a heap of 16 MiB or more, and less of a smaller one --
+// which matters exactly when the heap is nearly full and a collection is what frees the rest.
+private[gc] chunk_length(room: usize) -> usize
+    val share = room / 64
+    val wanted = if share < CHUNK_MIN then CHUNK_MIN else if share > CHUNK_MAX then CHUNK_MAX else share
+    val len = if wanted > room then room else wanted
+    len & ~FLAGS
 
 // The `ctx` this heap was made with. One load, for a hook that needs the client's state.
 @inline
@@ -680,6 +699,228 @@ private take(h: *Heap, size: usize, kind: *Kind, clear: bool) -> *u8
     hand_out(h, f, kind, size, clear)
 end take
 
+// -- Chunks: allocation with no lock ---------------------------------------------------------------
+//
+// **A heap is one thread's at a time**, so a client with several threads allocating takes a lock
+// around every `alloc`, and with eight threads the lock is the program. A chunk takes the lock off
+// the common path: a thread **claims** a run of the arena under the client's lock, then hands out
+// objects from it by bumping a pointer, touching nothing shared. Before a collection the client
+// **retires** every chunk, and the unused tail becomes an ordinary free block.
+//
+// **An object from a chunk is an object like any other.** Its header is the one `alloc` writes, so
+// marking, the weak passes, the sweep and `dispose` read it with no idea where it came from, and none
+// of them changed when chunks were added. What a chunk holds that the heap does not is three counts
+// (objects, weak objects, ephemerons), kept in the chunk so that the thread need not touch the heap,
+// and added to the heap's own at retire.
+
+// The largest payload `chunk_alloc` hands out. A larger object goes to `alloc`, under the client's
+// lock. It bounds what an early retire wastes -- at most one object's length short of the chunk's
+// end -- and it is what keeps the rounding in `chunk_alloc` from wrapping without a check of its own.
+const CHUNK_OBJECT_MAX: usize = 2048
+
+private const CHUNK_MIN: usize = 32768
+private const CHUNK_MAX: usize = 262144
+
+// One thread's chunk: a run of the arena it bumps through with no lock. Make it with `chunk`; only
+// its own thread touches it, except under the client's lock with that thread stopped.
+//
+// **`limit` stops `min_block()` short of the chunk's real end.** That reserve is what lets `retire`
+// write a free header at whatever point the thread stopped: a tail of one grain could not hold a
+// header, and every block length is a multiple of a grain.
+struct Chunk
+    private top: usize
+    private limit: usize
+    private start: usize
+    private live: usize
+    private weakeners: usize
+    private ephemerals: usize
+
+// An empty chunk. Its first `chunk_alloc` answers null, which is what sends a thread to `claim`.
+chunk() -> Chunk = Chunk(0, 0, 0, 0, 0, 0)
+
+// Retire whatever `c` holds, then make it a fresh chunk with room for at least one object of `size`
+// payload bytes. **Called under the client's lock**: it changes the heap's free lists.
+//
+// The chunk is carved from the coalesced free blocks first -- after a collection that is where nearly
+// all the free space is -- then from the part of the arena never handed out, then from any free block
+// that fits the one object, so a fragmented heap still answers with a small chunk.
+//
+// **`false` means no block in the heap holds the object**: retire every chunk, collect and try
+// again. It also answers `false` for a `size` above `CHUNK_OBJECT_MAX`, which no chunk serves; under
+// `checks` that request traps instead, since it is the client's bug.
+claim(h: *Heap, c: *Chunk, size: usize) -> bool
+    if option_checks
+        if size > CHUNK_OBJECT_MAX then trap()
+
+    retire(h, c)
+
+    if size > CHUNK_OBJECT_MAX then return false
+
+    // The block a chunk must be to hold the object and still leave its reserve.
+    val fit = align_up(size + sizeof(Header)) + min_block()
+    val want = if h.chunk_len > fit then h.chunk_len else fit
+
+    // Every block in a class above `fit`'s fits it, so the head of the first non-empty one is taken
+    // unread, exactly as `take_larger` does for an allocation. The search starts at the class of a
+    // whole chunk, so a chunk does not eat the one block a later small chunk could have had.
+    val fit_class = bin_of(fit)
+    val whole = bin_of(h.chunk_len)
+    val below = if whole > fit_class + 1 then whole - 1 else fit_class
+
+    var f = take_larger(h, below)
+
+    if f != null
+        if size_of(f) > want then split(h, f, want)
+        open_chunk(h, c, f)
+        return true
+
+    // The part of the arena never handed out, cut to whole grains: `cap` need not be one.
+    val room = (h.cap - h.bump) & ~FLAGS
+
+    if room >= fit
+        var o: *Header = ptr_cast(usize(h.base) + h.bump)
+        val len = if room < want then room else want
+
+        h.bump += len
+        o.word = len
+        open_chunk(h, c, o)
+        return true
+
+    // A small chunk out of whatever still fits: the classes between the object's and a whole chunk's,
+    // then every block of the object's own class.
+    f = take_larger(h, fit_class)
+
+    if f == null then f = take_from_bin(h, fit_class, fit, h.cap)
+
+    if f == null then return false
+
+    split(h, f, fit)
+    open_chunk(h, c, f)
+    true
+end claim
+
+// Make the block at `o`, of the length its word says, the chunk `c`, and charge it to `live_size`.
+private open_chunk(h: *Heap, c: *Chunk, o: *Header)
+    val len = size_of(o)
+
+    c.start = usize(o)
+    c.top = usize(o)
+    c.limit = usize(o) + len - min_block()
+    c.live = 0
+    c.weakeners = 0
+    c.ephemerals = 0
+
+    // **The whole chunk is charged now and the unused tail refunded at retire**, so `live_size`
+    // over-reports while chunks are out -- a client's budget fires a little early, never late.
+    h.live_bytes += len
+    h.chunks += 1
+
+// Storage for one object of `kind` from `c`, zeroed, with no lock. **`null` when `size` is above
+// `CHUNK_OBJECT_MAX` or the chunk has no room left** -- for an empty chunk, always. Everything `alloc`
+// promises holds: the header is the one `alloc` writes, the payload is 16-byte aligned, and
+// allocating never collects.
+@inline
+chunk_alloc(c: *Chunk, size: usize, kind: *Kind) -> *u8 = carve(c, size, kind, true)
+
+// The same, not zeroed. Every caveat of `alloc_raw` carries over: every byte is written before the
+// next allocation and the next safepoint, and no reference-counted member is assigned first.
+@inline
+chunk_alloc_raw(c: *Chunk, size: usize, kind: *Kind) -> *u8 = carve(c, size, kind, false)
+
+// The body both share: a compare, a bump and the two header words. The heap is not touched.
+@inline
+private carve(c: *Chunk, size: usize, kind: *Kind, clear: bool) -> *u8
+    // A constant `size` folds this away; it is also what keeps `size + header` from wrapping.
+    if size > CHUNK_OBJECT_MAX then return null
+
+    if option_checks
+        if kind == null then trap()
+        if kind.trace == null then trap()
+
+    val need = align_up(size + sizeof(Header))
+
+    // An empty chunk has `top` and `limit` both zero, so this answers null for it with no test of
+    // its own.
+    if need > c.limit - c.top then return null
+
+    var o: *Header = ptr_cast(c.top)
+
+    c.top += need
+    o.kind = kind
+    o.word = need
+    c.live += 1
+
+    if kind.weaken != null then c.weakeners += 1
+    if kind.ephemeron != null then c.ephemerals += 1
+
+    val p = payload_of(o)
+
+    if clear then zero(p, size)
+
+    p
+end carve
+
+// Give back what `c` did not use and add its counts to the heap's, leaving `c` empty. **Called
+// under the client's lock, or with the world stopped**, and for every chunk before `collect` or
+// `dispose`: an unretired chunk ends in bytes no walk of the arena can read. Retiring an empty chunk
+// does nothing. Constant work under the lock: the chunk's objects are not visited.
+retire(h: *Heap, c: *Chunk)
+    if c.limit == 0 then return
+
+    if option_checks then check_chunk(c)
+
+    val tail = c.limit + min_block() - c.top
+    var t: *Header = ptr_cast(c.top)
+
+    // A free block like any other. It may sit beside another free block until the next sweep merges
+    // them; nothing reads adjacency between sweeps.
+    t.kind = null
+    push_free(h, t, tail)
+
+    h.live += c.live
+    h.weakeners += c.weakeners
+    h.ephemerals += c.ephemerals
+    h.live_bytes -= tail
+    h.chunks -= 1
+
+    *c = chunk()
+
+// What `checks` asks of a chunk at retire: its objects tile it from its start to its top, each a
+// valid unflagged block of a kind with a tracer, and they are as many, of each hook, as it counted.
+// This is the one place a client's misuse of a chunk can be caught before it reaches a sweep.
+private check_chunk(c: *Chunk)
+    if c.top > c.limit then trap()
+
+    var at = c.start
+    var objects: usize = 0
+    var weakeners: usize = 0
+    var ephemerals: usize = 0
+
+    while at < c.top
+        val o: *Header = ptr_cast(at)
+        val sz = size_of(o)
+
+        if sz < min_block() || sz > c.top - at then trap()
+        if o.word & FLAGS != 0 then trap()
+        if o.kind == null || o.kind.trace == null then trap()
+
+        objects += 1
+        if o.kind.weaken != null then weakeners += 1
+        if o.kind.ephemeron != null then ephemerals += 1
+        at += sz
+
+    if at != c.top then trap()
+    if objects != c.live || weakeners != c.weakeners || ephemerals != c.ephemerals then trap()
+end check_chunk
+
+// How many chunks are claimed and not yet retired. `collect` and `dispose` require none.
+chunks_out(h: *Heap) -> usize = h.chunks
+
+// For the tests: a heap's chunk length, and a chunk's whole length and the room left in it.
+private[gc] chunk_len_of(h: *Heap) -> usize = h.chunk_len
+private[gc] chunk_span(c: *Chunk) -> usize = if c.limit == 0 then 0 else c.limit + min_block() - c.start
+private[gc] chunk_room(c: *Chunk) -> usize = c.limit - c.top
+
 // Whether `p`'s header would lie outside the part of the arena that holds blocks -- which is to say
 // `p` is not an object of this heap. `null`, every address below the arena and every address past
 // its used part all answer `true`.
@@ -804,7 +1045,14 @@ end check_heap
 //
 // Phases 2 and 3 are each skipped outright where no live object's kind has their hook, which is
 // every collection of a program that holds no weak value -- see `Heap.weakeners`.
+//
+// **Every chunk is retired first, and a chunk still out traps here whatever the options.** The tail of
+// an unretired chunk holds whatever bytes were there before -- a zero length among them, which would
+// send the walks below round the same address for ever. One load and a compare per collection turns
+// that hang into a trap at the call that caused it.
 collect(h: *Heap, roots: Roots)
+    if h.chunks != 0 then trap()
+
     roots(h)
     drain(h)
 
@@ -887,8 +1135,11 @@ end sweep
 //
 // **This is what runs at the end of a program**, and without it a finalizer that closes a file or
 // releases a `Buf` never runs for anything still reachable when the interpreter stops. Nothing is
-// traced and nothing is marked: teardown has no reachability question to answer.
+// traced and nothing is marked: teardown has no reachability question to answer. Every chunk is
+// retired first; one still out traps, as it does in `collect`.
 dispose(h: *Heap)
+    if h.chunks != 0 then trap()
+
     var off: usize = 0
     while off < h.bump
         var p: *Header = ptr_cast(usize(h.base) + off)
