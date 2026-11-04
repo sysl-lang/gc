@@ -566,8 +566,8 @@ resume
   consistent safepoint handshake — as avin does — has already ordered them before the collecting
   thread reads them; gc asks nothing more.
 
-A client that never claims pays nothing: `alloc`, `alloc_raw`, `mark` and the sweep are the same
-instructions they were in 0.3.0.
+A client that never claims pays nothing: `alloc`, `alloc_raw`, `mark` and the sweep carry no chunk
+code on their paths.
 
 ## Tests
 
