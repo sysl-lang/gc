@@ -82,7 +82,7 @@ type Weaker = *extern(*u8, *Heap) -> unit
 type Ephemeron = *extern(*u8, *Heap) -> bool
 
 // What `collect` is handed: grey every root, by calling `mark` on each.
-type Roots = *extern(*Heap) -> unit
+type Roots = *extern(@lets_out *Heap) -> unit
 
 // What the collector knows about one kind of object.
 //
