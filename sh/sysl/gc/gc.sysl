@@ -48,7 +48,9 @@ import sysl.raw.ptr_cast
 // collector buys locality and pays for it by making every one of those illegal.
 
 // Grey everything this object references, by calling `mark` on each. Every object kind has one.
-type Tracer = *extern(*u8, *Heap) -> unit
+// `mark` links the object into the heap's grey list, so what is read through the heap outlives the
+// call: the parameter is `@lets_out`. The same holds for `Ephemeron` and `Roots`.
+type Tracer = *extern(*u8, @lets_out *Heap) -> unit
 
 // Release what this object owns outside the collected heap -- a `string`, a `Buf`, a file
 // descriptor, a C allocation. Runs during the sweep that frees the object, and from `dispose`.
@@ -79,10 +81,10 @@ type Weaker = *extern(*u8, *Heap) -> unit
 // run again afterwards, because that value may reference a key of some other entry. `collect` loops
 // this hook and the worklist together until a pass changes nothing, and that fixpoint is what an
 // ephemeron is.
-type Ephemeron = *extern(*u8, *Heap) -> bool
+type Ephemeron = *extern(*u8, @lets_out *Heap) -> bool
 
 // What `collect` is handed: grey every root, by calling `mark` on each.
-type Roots = *extern(*Heap) -> unit
+type Roots = *extern(@lets_out *Heap) -> unit
 
 // What the collector knows about one kind of object.
 //
