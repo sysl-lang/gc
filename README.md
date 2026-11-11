@@ -271,7 +271,7 @@ block — is still not a legal argument; the `checks` option traps on it.
 ## Checks
 
 ```hocon
-gc { git = "github.com/sysl-lang/gc", version = "0.3.1", options = { checks = true } }
+gc { git = "github.com/sysl-lang/gc", version = "0.3.2", options = { checks = true } }
 ```
 
 The `checks` option (default `false`) validates the heap as it runs and traps on the first fault:
@@ -486,7 +486,7 @@ The block a consumer writes:
 
 ```hocon
 dependencies {
-  gc { git = "github.com/sysl-lang/gc", version = "0.3.1" }
+  gc { git = "github.com/sysl-lang/gc", version = "0.3.2" }
 }
 ```
 
