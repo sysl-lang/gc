@@ -4,8 +4,7 @@ module sh.sysl.gc
 import sysl.raw.ptr_cast
 import sysl.sync.SpinLock
 import sysl.testing.skip
-import sysl.threads.Thread
-import sysl.threads.spawn
+import sysl.threads.scope
 
 // What chunks claim, run by `sysl test .`: a thread claims a run of the arena under a lock, hands
 // out objects from it with none, and retires it before a collection. Most of these tests are on one
@@ -723,17 +722,15 @@ private work(s: *Slot) -> unit
 chk_real_threads()
     var block = arena(4194304)
     val s: &Shared = Shared(heap(&block[0], 4194304, null), SpinLock(0), [Slot(null, chunk(), 0); WORKERS])
-    var threads: [WORKERS]Option[Thread] = [None; WORKERS]
 
     for i in 0..<WORKERS
         s.slots[i].shared = &*s
-    for i in 0..<WORKERS
-        threads[i] = spawn(&work, &s.slots[i])
 
-    for i in 0..<WORKERS
-        threads[i] match
-            Some(t) -> assert(t.join())
-            None -> assert(false, "a thread did not start")
+    // Every worker is joined when the scope ends.
+    scope((sc) ->
+        for i in 0..<WORKERS
+            val slot = &s.slots[i]
+            sc.spawn(() -> work(slot)))
 
     // The world is stopped: retire every thread's chunk, then collect.
     var claims: usize = 0
