@@ -1,6 +1,6 @@
 import graph
 
-// A heap far larger than the cache, where marking waits on memory, and one that fits in it, where it
-// does not.
-graph.run(1000000, 10)
-graph.run(20000, 200)
+// A heap far larger than the cache, reached in address order and shuffled, and one that fits in it.
+graph.run(1000000, 10, false)
+graph.run(1000000, 10, true)
+graph.run(20000, 200, false)

@@ -407,7 +407,20 @@ sixteen-slot ring in the heap, and what it reads is the header parked sixteen ma
 line has had that long to arrive. The ring is emptied whenever the worklist runs dry, before
 `is_live` answers and by `dispose`, so no client can see the delay. It is a fixed 16 words of the
 `Heap`, so the collector still uses no storage beyond the block it was given. `bench/mark` measures
-it (`sysl build --release -O2 --lib ../.. .` there).
+it (`sysl build --release -O2 --lib ../.. .` there), marking 4,000,001 objects of an interpreter's
+shape (records holding a string, a vector and its array) spread among garbage, best of ten
+collections, three runs each, on an M-series Mac:
+
+| marking order | without the ring | with it |
+|---|---|---|
+| shuffled: references unrelated to addresses | 141.6 ms, 35 ns an object | 45.6 ms, 11 ns |
+| address order, as just allocated | 16.1 ms, 4 ns | 18.0 ms, 4.5 ns |
+| 80,001 objects, all in cache | 206 µs | 228 µs |
+
+**The shuffled row is the one a long-running program lives in**: once its objects have been
+replaced a few times, what references what has nothing to do with where it sits, and every header
+is a miss. Address order is the one case the hardware prefetcher already covers by itself, and there
+the ring's bookkeeping costs about a tenth.
 
 `gc.trace_calls(&h)` answers how many times a tracer has been called since the heap was made. Each
 collection traces every object it reaches exactly once, so across a collection it rises by exactly
