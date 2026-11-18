@@ -1,0 +1,114 @@
+module graph
+
+import sh.sysl.gc
+import sysl.time
+import sysl.raw.ptr_cast
+
+// A mark-heavy heap shaped like an interpreter's: one root array holding `n` records, each record
+// holding a string-like leaf and a vector-like object that holds an array leaf -- four objects per
+// record, every one reached through a pointer field. Every object has one tracer, which reads the
+// reference offsets off a descriptor that begins with the collector's `Kind`, as a language runtime's
+// tracer does. A few hundred bytes of garbage are made between records, so the survivors lie spread
+// out across the arena with holes between them rather than packed together.
+
+struct Desc
+    kind: gc.Kind
+    refs: usize
+    off: [4]usize
+
+private var tracer_calls: usize = 0
+private var mark_calls: usize = 0
+
+trace_desc(p: *u8, h: *gc.Heap)
+    tracer_calls += 1
+    val d: *Desc = ptr_cast(gc.kind_of(p))
+    for i in 0..<d.refs
+        val slot: **u8 = ptr_cast(usize(p) + d.off[i])
+        mark_calls += 1
+        gc.mark(h, *slot)
+
+trace_array(p: *u8, h: *gc.Heap)
+    tracer_calls += 1
+    val count: *usize = ptr_cast(p)
+    val slots: **u8 = ptr_cast(usize(p) + 8)
+    for i in 0..<*count
+        mark_calls += 1
+        gc.mark(h, slots[i])
+
+var leaf: Desc = Desc(gc.Kind(&trace_desc, null, null, null), 0, [0, 0, 0, 0])
+var record: Desc = Desc(gc.Kind(&trace_desc, null, null, null), 2, [8, 16, 0, 0])
+var vector: Desc = Desc(gc.Kind(&trace_desc, null, null, null), 1, [8, 0, 0, 0])
+// The root array's `Weaker` runs once marking is final, and the root is the first block of the
+// arena, so the weak walk reaches it first: the time it stamps is where the mark phase ended.
+private var mark_end: long = 0
+
+stamp_mark_end(p: *u8, h: *gc.Heap)
+    mark_end = time.monotonic().us
+
+var array_kind: gc.Kind = gc.Kind(&trace_array, null, &stamp_mark_end, null)
+
+private var root: *u8 = null
+
+roots(h: *gc.Heap)
+    gc.mark(h, root)
+
+private take(h: *gc.Heap, c: *gc.Chunk, size: usize, kind: *gc.Kind) -> *u8
+    val p = gc.chunk_alloc(c, size, kind)
+    if p != null then return p
+    if !gc.claim(h, c, size) then return null
+    gc.chunk_alloc(c, size, kind)
+
+private put(p: *u8, off: usize, v: *u8)
+    val slot: **u8 = ptr_cast(usize(p) + off)
+    *slot = v
+
+// Builds the graph, collects once to free the garbage, then times `rounds` collections that mark the
+// same `4n + 1` objects and free nothing. Prints the counters and the time per marked object.
+run(n: usize, rounds: int)
+    var block: []u8 = [0; 1048576 * 1024]
+    var h = gc.heap(&block[0], block.len, null)
+    var c = gc.chunk()
+
+    root = gc.alloc(&h, 8 + n * 8, &array_kind)
+    assert(root != null, "the root array fits")
+    val count: *usize = ptr_cast(root)
+    *count = n
+    val slots: **u8 = ptr_cast(usize(root) + 8)
+
+    for i in 0..<n
+        val r = take(&h, &c, 24, &record.kind)
+        val s = take(&h, &c, 32, &leaf.kind)
+        val v = take(&h, &c, 16, &vector.kind)
+        val a = take(&h, &c, 16, &leaf.kind)
+        assert(r != null && s != null && v != null && a != null, "the arena holds the graph")
+        put(r, 8, s)
+        put(r, 16, v)
+        put(v, 8, a)
+        slots[i] = r
+        assert(take(&h, &c, 256, &leaf.kind) != null, "the arena holds the garbage")
+
+    gc.retire(&h, &c)
+    gc.collect(&h, &roots)
+    val objects = gc.live(&h)
+    assert(objects == 4 * n + 1, "every record survives, and nothing else")
+
+    var best: long = 0
+    var total: long = 0
+    var best_all: long = 0
+    tracer_calls = 0
+    mark_calls = 0
+    for k in 0..<rounds
+        val t0 = time.monotonic().us
+        gc.collect(&h, &roots)
+        val t1 = time.monotonic().us
+        val us = mark_end - t0
+        total += us
+        if k == 0 || us < best then best = us
+        if k == 0 || t1 - t0 < best_all then best_all = t1 - t0
+        assert(gc.live(&h) == objects, "a collection that frees nothing keeps every object")
+
+    val per_round = tracer_calls / usize(rounds)
+    print(f"objects=${objects} tracer_calls/round=${per_round} mark_calls/round=${mark_calls / usize(rounds)}\n")
+    print(f"mark: best=${best} us mean=${total / long(rounds)} us best-per-object=${best * 1000 / long(objects)} ns\n")
+    print(f"collect: best=${best_all} us (mark share ${best * 100 / best_all}%)\n")
+    gc.dispose(&h)

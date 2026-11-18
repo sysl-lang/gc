@@ -1,0 +1,405 @@
+module sh.sysl.gc
+@tests
+
+import sysl.raw.ptr_cast
+
+// What the mark phase claims, run by `sysl test .`: every object reachable from the roots is traced
+// exactly once, and everything else dies -- whatever the shape of the graph, however many marks wait
+// in the ring when a tracer returns, and however the objects were allocated.
+//
+// The reference here is a reachability walk of the test's own, over the same nodes, that never asks
+// the collector anything. A node's finalizer records its death by id, so every node's fate is checked
+// against the walk, not only the count.
+
+// A node: its id, how many children follow, and then that many references.
+private struct NodeHead
+    id: usize
+    count: usize
+
+private kids_of(p: *u8) -> **u8 = ptr_cast(usize(p) + sizeof(NodeHead))
+
+private head_of(p: *u8) -> *NodeHead = ptr_cast(p)
+
+private trace_node(p: *u8, h: *Heap)
+    val n: *NodeHead = ptr_cast(p)
+    val kids = kids_of(p)
+    for i in 0..<n.count
+        mark(h, kids[i])
+
+private const MAX_NODES: usize = 400000
+
+private var dead: []bool = []
+
+private note_death(p: *u8, h: *Heap)
+    val n: *NodeHead = ptr_cast(p)
+    dead[n.id] = true
+
+private var node_kind: Kind = Kind(&trace_node, &note_death, null, null)
+
+private var garbage_kind: Kind = Kind(&trace_node, null, null, null)
+
+private var mark_roots: []*u8 = []
+
+private roots_of_marks(h: *Heap)
+    for p in mark_roots
+        mark(h, p)
+
+private no_mark_roots(h: *Heap)
+    return
+
+private var seed: u64 = 2463534242
+
+private next_random() -> u64
+    seed = seed ^ (seed << 13)
+    seed = seed ^ (seed >> 7)
+    seed = seed ^ (seed << 17)
+    seed
+
+// Where the nodes come from: `alloc`, or a chunk with a piece of garbage between every two nodes, so
+// that after the first sweep the survivors sit among holes that later allocations fill.
+private struct Maker
+    h: *Heap
+    c: Chunk
+    chunked: bool
+
+private make_node(m: *Maker, id: usize, count: usize) -> *u8
+    val size = sizeof(NodeHead) + count * sizeof(usize)
+    var p: *u8 = null
+    if m.chunked && size <= CHUNK_OBJECT_MAX
+        p = chunk_alloc(&m.c, size, &node_kind)
+        if p == null
+            assert(claim(m.h, &m.c, size), "the arena holds the graph")
+            p = chunk_alloc(&m.c, size, &node_kind)
+        if chunk_alloc(&m.c, 64, &garbage_kind) == null
+            assert(claim(m.h, &m.c, 64), "the arena holds the garbage")
+            assert(chunk_alloc(&m.c, 64, &garbage_kind) != null)
+    else
+        p = alloc(m.h, size, &node_kind)
+    assert(p != null, "the arena holds the node")
+    val n: *NodeHead = ptr_cast(p)
+    n.id = id
+    n.count = count
+    p
+
+private finish(m: *Maker)
+    if m.chunked then retire(m.h, &m.c)
+
+// Every node reachable from `mark_roots`, by the test's own walk with an explicit stack.
+private reachable(nodes: []*u8) -> []bool
+    var seen: []bool = [false; nodes.len]
+    var stack: []*u8 = [null; MAX_NODES]
+    var top: usize = 0
+    for r in mark_roots
+        if r != null
+            val id = head_of(r).id
+            if !seen[id]
+                seen[id] = true
+                stack[top] = r
+                top += 1
+    while top > 0
+        top -= 1
+        val p = stack[top]
+        val n: *NodeHead = ptr_cast(p)
+        val kids = kids_of(p)
+        for i in 0..<n.count
+            val k = kids[i]
+            if k != null
+                val id = head_of(k).id
+                if !seen[id]
+                    seen[id] = true
+                    stack[top] = k
+                    top += 1
+    seen
+
+// Collect, then check every node of `nodes` that was alive going in: the reachable ones traced once
+// each and kept, the rest finalized. Answers how many survived.
+private collect_and_check(h: *Heap, nodes: []*u8, alive: *[]bool, note: string) -> usize
+    val want = reachable(nodes)
+    var expected: usize = 0
+    for i in 0..<nodes.len
+        if want[i] then expected += 1
+    for i in 0..<nodes.len
+        dead[i] = false
+
+    val before = trace_calls(h)
+    collect(h, &roots_of_marks)
+    assert_eq(trace_calls(h) - before, expected, f"${note}: every reachable node is traced exactly once")
+    assert_eq(live(h), expected, f"${note}: and nothing else survives")
+    assert_eq(ring_parked(h), 0, f"${note}: and no header is left waiting in the ring")
+    for i in 0..<nodes.len
+        if (*alive)[i]
+            assert(dead[i] == !want[i], f"${note}: node ${i} lives exactly when it is reachable")
+            (*alive)[i] = want[i]
+    expected
+
+// A random graph: `n` nodes of up to five children each, chosen from every node -- self-loops,
+// cycles and shared children included -- and `r` random roots; then half the roots dropped.
+private random_graph(chunked: bool, n: usize, r: usize)
+    var block: []u8 = [0; 1048576 * 16]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), chunked)
+    dead = [false; n]
+    seed = 2463534242
+
+    var nodes: []*u8 = [null; n]
+    for i in 0..<n
+        nodes[i] = make_node(&m, i, usize(next_random() % 6))
+    for i in 0..<n
+        val count = head_of(nodes[i]).count
+        val kids = kids_of(nodes[i])
+        for k in 0..<count
+            kids[k] = if next_random() % 8 == 0 then null else nodes[usize(next_random() % u64(n))]
+    finish(&m)
+
+    mark_roots = [null; r]
+    for i in 0..<r
+        mark_roots[i] = nodes[usize(next_random() % u64(n))]
+
+    var alive: []bool = [true; n]
+    val first = collect_and_check(&h, nodes, &alive, "first collection")
+    if n >= 1000 then assert(first > 0 && first < n, "the graph has both reachable and unreachable nodes")
+
+    for i in 0..<r
+        if i % 2 == 0 then mark_roots[i] = null
+    val second = collect_and_check(&h, nodes, &alive, "half the roots dropped")
+    assert(second <= first)
+
+    mark_roots = []
+    collect(&h, &no_mark_roots)
+    assert_eq(live(&h), 0, "with no roots everything dies")
+    dead = []
+
+@test("every node of a random graph reachable from the roots is traced once and kept, and every other dies")
+mrk_random_graph()
+    random_graph(false, 20000, 40)
+
+@test("and the same holds for a graph allocated through chunks among garbage")
+mrk_random_graph_chunked()
+    random_graph(true, 20000, 40)
+
+@test("a graph of a few nodes, fewer than the ring holds, is marked completely")
+mrk_tiny_graph()
+    random_graph(false, 5, 2)
+    random_graph(true, 12, 3)
+
+// A chain of `depth` nodes, each the only child of the one before.
+private chain(chunked: bool, depth: usize)
+    var block: []u8 = [0; 1048576 * 64]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), chunked)
+    dead = [false; depth]
+
+    var nodes: []*u8 = [null; depth]
+    for i in 0..<depth
+        nodes[i] = make_node(&m, i, 1)
+    for i in 0..<depth - 1
+        kids_of(nodes[i])[0] = nodes[i + 1]
+    finish(&m)
+
+    mark_roots = [nodes[0]]
+    var alive: []bool = [true; depth]
+    assert_eq(collect_and_check(&h, nodes, &alive, "deep chain"), depth)
+
+    // Cut it in the middle: the far half goes.
+    kids_of(nodes[depth / 2])[0] = null
+    assert_eq(collect_and_check(&h, nodes, &alive, "cut chain"), depth / 2 + 1)
+    mark_roots = []
+    dead = []
+
+@test("a chain of 300,000 nodes is marked with no recursion, every link once")
+mrk_deep_chain()
+    chain(false, 300000)
+
+@test("and so is one allocated through chunks among garbage")
+mrk_deep_chain_chunked()
+    chain(true, 300000)
+
+// A cycle of `n` nodes, reached from one root or from none.
+@test("a reachable cycle is traced once round, and an unreachable one dies whole")
+mrk_cycle()
+    val n: usize = 10000
+    var block: []u8 = [0; 1048576 * 4]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), false)
+    dead = [false; n]
+
+    var nodes: []*u8 = [null; n]
+    for i in 0..<n
+        nodes[i] = make_node(&m, i, 1)
+    for i in 0..<n
+        kids_of(nodes[i])[0] = nodes[(i + 1) % n]
+
+    mark_roots = [nodes[n / 3]]
+    var alive: []bool = [true; n]
+    assert_eq(collect_and_check(&h, nodes, &alive, "rooted cycle"), n)
+    mark_roots = []
+    assert_eq(collect_and_check(&h, nodes, &alive, "unrooted cycle"), 0)
+    dead = []
+
+// One node with `fan` children drawn from `distinct` leaves: each leaf repeated far apart, and runs
+// of one leaf repeated more times than the ring is long, so the same header waits in the ring twice.
+@test("a node with 100,000 references to a thousand leaves traces each leaf once")
+mrk_wide_fan_out()
+    val fan: usize = 100000
+    val distinct: usize = 1000
+    var block: []u8 = [0; 1048576 * 4]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), false)
+    dead = [false; distinct + 1]
+
+    var nodes: []*u8 = [null; distinct + 1]
+    for i in 0..<distinct
+        nodes[i] = make_node(&m, i, 0)
+    nodes[distinct] = make_node(&m, distinct, fan)
+    val kids = kids_of(nodes[distinct])
+    for i in 0..<fan
+        kids[i] = if i < fan / 2 then nodes[i % distinct] else nodes[(i / 40) % distinct]
+
+    mark_roots = [nodes[distinct]]
+    var alive: []bool = [true; distinct + 1]
+    assert_eq(collect_and_check(&h, nodes, &alive, "wide fan-out"), distinct + 1)
+
+    // Only the even leaves referenced now: the odd ones die.
+    for i in 0..<fan
+        kids[i] = nodes[(i % (distinct / 2)) * 2]
+    assert_eq(collect_and_check(&h, nodes, &alive, "half the leaves"), distinct / 2 + 1)
+    mark_roots = []
+    dead = []
+
+@test("a root with one fewer, exactly as many and one more children than the ring holds keeps them all")
+mrk_ring_boundaries()
+    for fan in [RING - 1, RING, RING + 1, 2 * RING, 2 * RING + 1]
+        var block: []u8 = [0; 65536]
+        var h = heap(&block[0], block.len, null)
+        var m = Maker(&h, chunk(), false)
+        dead = [false; fan + 1]
+        var nodes: []*u8 = [null; fan + 1]
+        for i in 0..<fan
+            nodes[i] = make_node(&m, i, 0)
+        nodes[fan] = make_node(&m, fan, fan)
+        for i in 0..<fan
+            kids_of(nodes[fan])[i] = nodes[i]
+        mark_roots = [nodes[fan]]
+        var alive: []bool = [true; fan + 1]
+        assert_eq(collect_and_check(&h, nodes, &alive, f"fan of ${fan}"), fan + 1)
+        mark_roots = []
+    dead = []
+
+@test("marks made by hand before a collection keep their objects, however few wait in the ring")
+mrk_hand_marks_survive()
+    var block: []u8 = [0; 65536]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), false)
+    dead = [false; 8]
+    var nodes: []*u8 = [null; 8]
+    for i in 0..<8
+        nodes[i] = make_node(&m, i, 0)
+    mark(&h, nodes[1])
+    mark(&h, nodes[5])
+    mark(&h, nodes[5])
+    collect(&h, &no_mark_roots)
+    assert_eq(live(&h), 2, "the two marked nodes survive, and only they")
+    assert(!dead[1] && !dead[5])
+    collect(&h, &no_mark_roots)
+    assert_eq(live(&h), 0, "and a collection clears what the hand marks left")
+    dead = []
+
+@test("dispose empties the ring, so a mark parked before it keeps nothing allocated after it")
+mrk_dispose_empties_the_ring()
+    var block: []u8 = [0; 65536]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), false)
+    dead = [false; 4]
+    val first = make_node(&m, 0, 0)
+    mark(&h, first)
+    dispose(&h)
+    val again = make_node(&m, 1, 0)
+    assert(again == first, "the disposed heap hands the same block out again")
+    collect(&h, &no_mark_roots)
+    assert_eq(live(&h), 0, "a mark from before dispose does not keep the new object")
+    assert(dead[1])
+    dead = []
+
+// An ephemeron that marks its value and asks `is_live` of it at once: the mark must be seen, though
+// its header is still waiting in the ring.
+private struct Pair
+    key: *u8
+    value: *u8
+
+private var hook_saw_its_mark: bool = false
+
+private ephemeron_pair(p: *u8, h: *Heap) -> bool
+    val e: *Pair = ptr_cast(p)
+    if !is_live(h, e.key) || is_live(h, e.value) then return false
+    mark(h, e.value)
+    hook_saw_its_mark = is_live(h, e.value)
+    true
+
+private trace_pair(p: *u8, h: *Heap)
+    return
+
+private var pair_kind: Kind = Kind(&trace_pair, null, null, &ephemeron_pair)
+
+@test("an ephemeron's own mark is seen by is_live inside the same hook")
+mrk_is_live_sees_a_parked_mark()
+    var block: []u8 = [0; 65536]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), false)
+    dead = [false; 4]
+    val key = make_node(&m, 0, 0)
+    val value = make_node(&m, 1, 0)
+    val e: *Pair = ptr_cast(alloc(&h, sizeof(Pair), &pair_kind))
+    e.key = key
+    e.value = value
+    mark_roots = [ptr_cast(e), key]
+    hook_saw_its_mark = false
+    collect(&h, &roots_of_marks)
+    assert(hook_saw_its_mark, "is_live answered true for the value the hook had just marked")
+    assert_eq(live(&h), 3, "the pair, its key and the value its key keeps")
+    assert(!dead[1])
+    mark_roots = []
+    dead = []
+
+// An ephemeron that marks its value on every pass, already marked or not, and answers `false` from
+// its second pass on -- rightly, since nothing new was marked. That last mark still waits in the ring
+// when the pass ends.
+private var remarks: int = 0
+
+private ephemeron_remarks(p: *u8, h: *Heap) -> bool
+    val e: *Pair = ptr_cast(p)
+    if is_live(h, e.key) then mark(h, e.value)
+    remarks += 1
+    remarks == 1
+
+private var remark_pair_kind: Kind = Kind(&trace_pair, null, null, &ephemeron_remarks)
+
+@test("a mark an ephemeron makes on a pass that answers false is settled before the sweep")
+mrk_ephemeron_false_pass_leaves_no_mark_parked()
+    var block: []u8 = [0; 65536]
+    var h = heap(&block[0], block.len, null)
+    var m = Maker(&h, chunk(), false)
+    dead = [false; 4]
+    val key = make_node(&m, 0, 0)
+    val value = make_node(&m, 1, 0)
+    val e: *Pair = ptr_cast(alloc(&h, sizeof(Pair), &remark_pair_kind))
+    e.key = key
+    e.value = value
+    mark_roots = [ptr_cast(e), key]
+    remarks = 0
+    val before = trace_calls(&h)
+    collect(&h, &roots_of_marks)
+    assert_eq(remarks, 2, "a pass that answered true, then one that answered false")
+    assert_eq(ring_parked(&h), 0, "the second pass's mark did not outlive the collection")
+    assert_eq(trace_calls(&h) - before, 3, "the pair, the key and the value, once each")
+    assert_eq(live(&h), 3)
+
+    // The key and the pair go; the value goes with them, and its block is handed out again.
+    mark_roots = []
+    collect(&h, &no_mark_roots)
+    assert_eq(live(&h), 0, "with no roots nothing survives")
+    assert(dead[1])
+    val again = make_node(&m, 2, 0)
+    collect(&h, &no_mark_roots)
+    assert_eq(live(&h), 0, "and nothing left over from the ephemeron keeps a new object alive")
+    assert(again != null)
+    dead = []

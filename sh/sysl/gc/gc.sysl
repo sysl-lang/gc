@@ -5,6 +5,10 @@ module sh.sysl.gc
 import sysl.math.Bits
 import sysl.raw.ptr_cast
 
+// For the prefetch `mark` issues ahead of reading a header. A hint, not a capability: it reads
+// nothing and never faults, and on a processor with no prefetch instruction it is nothing at all.
+import sysl.hint.{prefetch, Access, Locality}
+
 // A tracing garbage collector over storage the caller supplies.
 //
 // Reference counting cannot free a cycle, and a language with objects that point at each other
@@ -261,6 +265,21 @@ struct Heap
     // keeps its offset and the code that reads them is the same instructions it was before chunks.
     private chunks: usize
     private chunk_len: usize
+
+    // How many times a tracer has been called since the heap was made: one per object a collection
+    // reached, so a test can see that nothing was traced twice and nothing reachable was skipped.
+    private traced: usize
+
+    // The pointers `mark` has been handed and has not yet read the header of, and where the next one
+    // goes -- see `mark`. A slot is `null` when it holds nothing, and every slot is `null` between
+    // collections.
+    private ring_at: u4
+    private ring: [RING]*Header
+
+// How many marks a header's read waits behind its prefetch. `ring_at` is a `u4` so that it indexes the
+// ring with no bounds check and wraps on its own. Module-visible so that `mark_tests.sysl` can build
+// graphs just either side of it.
+private[gc] const RING: usize = 16
 
 private align_up(n: usize) -> usize = (n + 15) & ~15usize
 
@@ -561,7 +580,7 @@ heap(base: *u8, cap: usize, ctx: *u8) -> Heap
     val most = ~0usize - sizeof(Header) - (GRAIN - 1)
     val left = if cap > lead then cap - lead else 0
     val room = if left > most then most else left
-    Heap(&base[lead], room, ctx, 0, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0, 0, 0, chunk_length(room))
+    Heap(&base[lead], room, ctx, 0, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0, 0, 0, chunk_length(room), 0, 0, [null; RING])
 
 // How long a chunk is in an arena of `room` bytes: a sixty-fourth of it, held between 32 and 256
 // kilobytes and cut to whole grains -- and never more than the arena itself, so a small heap asks for
@@ -1009,19 +1028,53 @@ private outside(h: *Heap, o: *Header) -> bool = usize(o) -% usize(h.base) >= h.b
 // into the arena must be the payload of a live object or the mark traps.
 //
 // This is the only function a `Tracer` needs, and the only one it may call.
+//
+// **A header is read sixteen marks after it is handed over, not at once.** Reading it is the cost of
+// marking: the object was last touched when it was made, so on a heap of any size its header is not
+// in the cache, and a mark that reads it at once waits out a trip to memory for every reference --
+// one after another, since each tracer call is a few such waits in a row. So `mark` asks for the line
+// and parks the header in `Heap.ring`, and what it reads is the header parked sixteen marks ago, whose
+// line has had that long to arrive. Sixteen misses are in flight where there was one. The ring is
+// emptied whenever the worklist runs dry and before `is_live` answers, so no caller can see the delay.
 @inline
 mark(h: *Heap, p: *u8)
-    var o: *Header = ptr_cast(usize(p) -% sizeof(Header))
+    val o: *Header = ptr_cast(usize(p) -% sizeof(Header))
     if outside(h, o)
         if option_checks
             if p != null then h.foreign += 1
         return
     if option_checks then check_object(h, p)
+    prefetch(o, Write, High)
+    val i = h.ring_at
+    val q = h.ring[i]
+    h.ring[i] = o
+    h.ring_at = i +% 1
+    if q != null then shade(h, q)
+
+// Mark one object whose header is to be read now, and put it on the worklist if this is the edge where
+// `MARKED` is set.
+@inline
+private shade(h: *Heap, o: *Header)
     val w = o.word
     if w & MARKED != 0 then return
     o.word = w | MARKED
     o.next = h.graylist
     h.graylist = o
+
+// How many headers wait in the ring. Zero between collections; `mark_tests.sysl` asserts it.
+private[gc] ring_parked(h: *Heap) -> usize
+    var n: usize = 0
+    for i in 0..<RING
+        if h.ring[i] != null then n += 1
+    n
+
+// Shade every object still parked in the ring, and empty it.
+private settle(h: *Heap)
+    for i in 0..<RING
+        val q = h.ring[i]
+        if q != null
+            h.ring[i] = null
+            shade(h, q)
 
 // Whether marking has decided this object survives the collection now running.
 //
@@ -1035,13 +1088,25 @@ is_live(h: *Heap, p: *u8) -> bool
     val o: *Header = ptr_cast(usize(p) -% sizeof(Header))
     if outside(h, o) then return p != null
     if option_checks then check_object(h, p)
+    settle(h)
     o.word & MARKED != 0
 
+// Trace the worklist until it is empty and the ring holds nothing that would refill it.
+//
+// Popping an object asks for the line of the one under it, which is the next to pop unless this
+// one's tracer greys something first -- and the bottom of the worklist is where a wide object's
+// children sit, each made long ago and each waiting there for its turn.
 private drain(h: *Heap)
-    while h.graylist != null
-        var o = h.graylist
-        h.graylist = o.next
-        o.kind.trace(payload_of(o), h)
+    loop
+        while h.graylist != null
+            val o = h.graylist
+            val next = o.next
+            h.graylist = next
+            prefetch(next, Read, High)
+            h.traced += 1
+            o.kind.trace(payload_of(o), h)
+        settle(h)
+        if h.graylist == null then return
 
 // What `checks` asks of every pointer into the arena handed to `mark` or `is_live`: that it is the
 // payload of a live object of this heap. Each failure is a trap, at the mark that was handed the bad
@@ -1090,6 +1155,9 @@ private check_heap(h: *Heap)
             f = f.next
 
     if binned != free_blocks then trap()
+
+    for i in 0..<RING
+        if h.ring[i] != null then trap()
 end check_heap
 
 // Grey the roots, settle what is reachable, clear dead weak slots, then free what was not reached.
@@ -1135,7 +1203,9 @@ collect(h: *Heap, roots: Roots)
                 if e.kind.ephemeron(payload_of(e), h)
                     changed = true
             off += w & ~FLAGS
-        if changed then drain(h)
+        // Drained whatever the pass answered: a hook that marks a value already marked rightly
+        // answers `false`, and that mark still waits in the ring, which must be empty by the sweep.
+        drain(h)
 
     if h.weakeners > 0
         h.weak_walks += 1
@@ -1217,6 +1287,8 @@ dispose(h: *Heap)
             p.word = sz | FREE
         off += sz
     h.graylist = null
+    for i in 0..<RING
+        h.ring[i] = null
     h.live = 0
     h.live_bytes = 0
     h.weakeners = 0
@@ -1236,6 +1308,11 @@ ephemeron_objects(h: *Heap) -> usize = h.ephemerals
 // the ephemeron fixpoint, one per weaken pass. A collection of a heap holding no weak object adds
 // nothing to it.
 weak_walks(h: *Heap) -> usize = h.weak_walks
+
+// How many times a `Tracer` has been called since the heap was made. Each collection traces every
+// object it reaches exactly once, so across one collection this rises by exactly how many objects
+// survived it.
+trace_calls(h: *Heap) -> usize = h.traced
 
 // How many BYTES those objects hold, headers included.
 //

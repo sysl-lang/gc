@@ -1,0 +1,8 @@
+// A mark-phase benchmark for this package: `sysl build --release -O2 --lib ../.. .` from here. It is
+// not part of the package -- a consumer of `gc` never fetches it as a module.
+
+package {
+  name    = "markbench"
+  version = "0.0.0"
+  sysl    = "0.10.0"
+}

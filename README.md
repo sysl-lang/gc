@@ -397,8 +397,21 @@ payload in every layout.
 **The mark phase is a loop, not a recursion.** A worklist threaded through the object headers means a
 list a million long and a tree a million deep both cost O(1) stack. That is not an optimization: a
 recursive mark phase is a stack overflow waiting for a client's data to get large enough, and it is
-the one place where being simple and being correct come apart. `sysl test .` marks a 20,000-deep
+the one place where being simple and being correct come apart. `sysl test .` marks a 300,000-deep
 chain to hold the line.
+
+**A mark reads its object's header sixteen marks later, not at once.** On a heap larger than the
+cache, the cost of marking is the cache miss on each header, and a mark that reads the header at once
+waits out those misses one after another. So `mark` prefetches the header's line and parks it in a
+sixteen-slot ring in the heap, and what it reads is the header parked sixteen marks earlier, whose
+line has had that long to arrive. The ring is emptied whenever the worklist runs dry, before
+`is_live` answers and by `dispose`, so no client can see the delay. It is a fixed 16 words of the
+`Heap`, so the collector still uses no storage beyond the block it was given. `bench/mark` measures
+it (`sysl build --release -O2 --lib ../.. .` there).
+
+`gc.trace_calls(&h)` answers how many times a tracer has been called since the heap was made. Each
+collection traces every object it reaches exactly once, so across a collection it rises by exactly
+`live(&h)`.
 
 ## What an allocation costs
 
@@ -611,3 +624,11 @@ heap state has changed.
 The chunk tests (`chunk_tests.sysl`) are checked the same way: with the reserve dropped ten of them
 fail, with the weak counting dropped from `chunk_alloc` the weak-object test fails, and with the tail
 left uncredited at `retire` six `live_size` assertions fail.
+
+The mark tests (`mark_tests.sysl`) check every node of random graphs, chains, cycles and a 100,000-wide
+fan-out against a reachability walk of their own, through `trace_calls`, `live` and a finalizer that
+records each death by id. They are checked the same way: with the ring left unemptied when the
+worklist runs dry, ten of the other eleven fail; with `is_live` not emptying it first, the ephemeron that
+asks about its own mark fails; with `dispose` leaving it full, a mark parked before `dispose` keeps an
+object allocated after it; and with the drain after an ephemeron pass that answered `false` dropped,
+that pass's mark is still parked after the collection.

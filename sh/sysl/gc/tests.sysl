@@ -2335,6 +2335,7 @@ header_word_round_trips()
     for i in 0..<48
         if i % 3 == 0 then mark(&h, objs[i])
     for i in 0..<48
+        assert(is_live(&h, objs[i]) == (i % 3 == 0), "a mark is seen by is_live at once")
         assert(block_marked(objs[i]) == (i % 3 == 0), "a mark sets exactly its own object's bit")
         assert_eq(block_bytes(objs[i]), block_length(i * 5), "and leaves every length alone")
         assert(!block_free(objs[i]))
@@ -2605,6 +2606,7 @@ foreign_marks_is_a_stat()
     mark(&h, null)
     assert_eq(foreign_marks(&h), foreign_expected(5), "another heap's object is foreign to this one; ours and null are not")
     assert_eq(foreign_marks(&other), 0, "and the other heap counted nothing")
+    assert(is_live(&h, ours), "is_live sees our object's mark")
     assert(!block_marked(theirs), "the other heap's object was not marked")
     assert(block_marked(ours))
 
