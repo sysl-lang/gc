@@ -723,9 +723,9 @@ const CHUNK_OBJECT_MAX: usize = 2048
 private const CHUNK_MIN: usize = 32768
 private const CHUNK_MAX: usize = 262144
 
-// The shortest free block a claim reuses before it carves from the bump region: 8 KiB, which holds
-// three objects of `CHUNK_OBJECT_MAX` with the reserve. A shorter hole would send its thread back to
-// the lock after a handful of allocations, so it waits until the bump region is spent.
+// The free block a claim prefers once no whole chunk is free: 8 KiB, which holds three objects of
+// `CHUNK_OBJECT_MAX` with the reserve. A shorter hole is still taken before the bump region -- see
+// `claim` -- but only once no block this long is left.
 private[gc] const CLAIM_MIN: usize = 8192
 
 // The shortest free block a claim takes ahead of the bump region, for a heap of chunk length `len` and
@@ -738,9 +738,14 @@ private[gc] claim_least(len: usize, fit: usize) -> usize
 // One thread's chunk: a run of the arena it bumps through with no lock. Make it with `chunk`; only
 // its own thread touches it, except under the client's lock with that thread stopped.
 //
-// **`limit` stops `min_block()` short of the chunk's real end.** That reserve is what lets `retire`
-// write a free header at whatever point the thread stopped: a tail of one grain could not hold a
-// header, and every block length is a multiple of a grain.
+// **`limit` stops `min_block()` short of the chunk's real end, `end`.** That reserve is what lets
+// `retire` write a free header at whatever point the thread stopped: a tail of one grain could not
+// hold a header, and every block length is a multiple of a grain.
+//
+// **The one exception is an object that fills the chunk to `end` exactly**, which leaves no tail to
+// write a header into. `carve` takes that on its failing branch and then pulls `limit` up to `end`,
+// so the chunk is spent. Without it a hole exactly one object long -- the commonest hole a sweep
+// leaves, where one object died between survivors -- could never take an object of that length.
 struct Chunk
     private top: usize
     private limit: usize
@@ -748,17 +753,19 @@ struct Chunk
     private live: usize
     private weakeners: usize
     private ephemerals: usize
+    private end: usize
 
 // An empty chunk. Its first `chunk_alloc` answers null, which is what sends a thread to `claim`.
-chunk() -> Chunk = Chunk(0, 0, 0, 0, 0, 0)
+chunk() -> Chunk = Chunk(0, 0, 0, 0, 0, 0, 0)
 
 // Retire whatever `c` holds, then make it a fresh chunk with room for at least one object of `size`
 // payload bytes. **Called under the client's lock**: it changes the heap's free lists.
 //
 // **Free space is reused before the arena grows.** The chunk is a free block of at least a whole chunk,
 // cut to `chunk_len`; else any free block of at least `claim_least` (8 KiB, or the object and its
-// reserve if more), taken whole; then the part of the arena never handed out; then any free block that
-// fits the one object, so a fragmented heap still answers with a small chunk.
+// reserve if more), taken whole; else the longest free block that holds the object and its reserve,
+// taken whole; else a free block exactly the object's length; and only then the part of the arena
+// never handed out.
 //
 // **`false` means no block in the heap holds the object**: retire every chunk, collect and try
 // again. It also answers `false` for a `size` above `CHUNK_OBJECT_MAX`, which no chunk serves; under
@@ -794,6 +801,20 @@ claim(h: *Heap, c: *Chunk, size: usize) -> bool
         f = take_larger(h, from)
         if f == null then f = take_from_bin(h, from, least, SCAN)
 
+    // **Then any hole that holds the object, longest first, still before the bump region.** A sweep
+    // between survivors leaves holes of a few objects each, and a claim that passed them over grew the
+    // arena by a chunk while they sat free: a steady 200k objects reached a high-water mark of 5.5
+    // times what was live, and the sweep walks all of it. A short hole sends its thread back to the
+    // lock sooner, which is why the longest goes first and the 8 KiB step above comes before it.
+    if f == null then f = take_longest(h, fit)
+
+    // **Then a hole exactly the object's length**, which `carve` fills to its end with no reserve.
+    // A small class is exact, so its head is that hole or the class is empty; a block above a kilobyte
+    // is rare enough to leave to the bump region.
+    val block = fit - min_block()
+
+    if f == null && block < LARGE_MIN then f = take_from_bin(h, bin_of(block), block, 1)
+
     if f != null
         if size_of(f) > want then split(h, f, want)
         open_chunk(h, c, f)
@@ -802,29 +823,41 @@ claim(h: *Heap, c: *Chunk, size: usize) -> bool
     // The part of the arena never handed out, cut to whole grains: `cap` need not be one.
     val room = (h.cap - h.bump) & ~FLAGS
 
-    if room >= fit
-        var o: *Header = ptr_cast(usize(h.base) + h.bump)
-        val len = if room < want then room else want
+    if room < fit then return false
 
-        h.bump += len
-        o.word = len
-        open_chunk(h, c, o)
-        return true
+    var o: *Header = ptr_cast(usize(h.base) + h.bump)
+    val len = if room < want then room else want
 
-    // A small chunk out of whatever still fits: any class above the object's, then every block of the
-    // object's own class.
-    val fit_class = bin_of(fit)
-
-    f = take_larger(h, fit_class)
-
-    if f == null then f = take_from_bin(h, fit_class, fit, h.cap)
-
-    if f == null then return false
-
-    split(h, f, fit)
-    open_chunk(h, c, f)
+    h.bump += len
+    o.word = len
+    open_chunk(h, c, o)
     true
 end claim
+
+// The highest class with a block on it, or `NBINS` if every bin is empty.
+private[gc] last_bin(h: *Heap) -> usize
+    if h.mask_hi != 0u64 then return 64 + usize(63 - h.mask_hi.leading_zeros())
+    if h.mask_lo != 0u64 then return usize(63 - h.mask_lo.leading_zeros())
+    NBINS
+
+// Unlink a block of at least `need` bytes from the highest class that has one, or null.
+//
+// Every block in a class above `need`'s own is longer than `need`, so the head of the highest class
+// is taken unread; only when that class is `need`'s own is it searched, to its end.
+private take_longest(h: *Heap, need: usize) -> *Header
+    val j = last_bin(h)
+    val own = bin_of(need)
+
+    if j == NBINS || j < own then return null
+
+    if j == own then return take_from_bin(h, j, need, h.cap)
+
+    val f = h.bins[j]
+
+    h.steps += 1
+    h.bins[j] = f.next
+    if f.next == null then bin_clear(h, j)
+    f
 
 // Make the block at `o`, of the length its word says, the chunk `c`, and charge it to `live_size`.
 private open_chunk(h: *Heap, c: *Chunk, o: *Header)
@@ -833,6 +866,7 @@ private open_chunk(h: *Heap, c: *Chunk, o: *Header)
     c.start = usize(o)
     c.top = usize(o)
     c.limit = usize(o) + len - min_block()
+    c.end = usize(o) + len
     c.live = 0
     c.weakeners = 0
     c.ephemerals = 0
@@ -866,9 +900,12 @@ private carve(c: *Chunk, size: usize, kind: *Kind, clear: bool) -> *u8
 
     val need = align_up(size + sizeof(Header))
 
-    // An empty chunk has `top` and `limit` both zero, so this answers null for it with no test of
-    // its own.
-    if need > c.limit - c.top then return null
+    // An empty chunk has `top`, `limit` and `end` all zero, so this answers null for it with no test
+    // of its own. Off the common path: an object that reaches `end` exactly fits with no reserve
+    // behind it, and spends the chunk.
+    if need > c.limit - c.top
+        if need != c.end - c.top then return null
+        c.limit = c.end
 
     var o: *Header = ptr_cast(c.top)
 
@@ -896,13 +933,14 @@ retire(h: *Heap, c: *Chunk)
 
     if option_checks then check_chunk(c)
 
-    val tail = c.limit + min_block() - c.top
-    var t: *Header = ptr_cast(c.top)
+    val tail = c.end - c.top
 
     // A free block like any other. It may sit beside another free block until the next sweep merges
-    // them; nothing reads adjacency between sweeps.
-    t.kind = null
-    push_free(h, t, tail)
+    // them; nothing reads adjacency between sweeps. A chunk its last object filled exactly has none.
+    if tail != 0
+        var t: *Header = ptr_cast(c.top)
+        t.kind = null
+        push_free(h, t, tail)
 
     h.live += c.live
     h.weakeners += c.weakeners
@@ -916,7 +954,9 @@ retire(h: *Heap, c: *Chunk)
 // valid unflagged block of a kind with a tracer, and they are as many, of each hook, as it counted.
 // This is the one place a client's misuse of a chunk can be caught before it reaches a sweep.
 private check_chunk(c: *Chunk)
-    if c.top > c.limit then trap()
+    if c.top > c.end then trap()
+    if c.top > c.limit && c.top != c.end then trap()
+    if c.end - c.top != 0 && c.end - c.top < min_block() then trap()
 
     var at = c.start
     var objects: usize = 0
@@ -945,7 +985,7 @@ chunks_out(h: *Heap) -> usize = h.chunks
 
 // For the tests: a heap's chunk length, and a chunk's whole length and the room left in it.
 private[gc] chunk_len_of(h: *Heap) -> usize = h.chunk_len
-private[gc] chunk_span(c: *Chunk) -> usize = if c.limit == 0 then 0 else c.limit + min_block() - c.start
+private[gc] chunk_span(c: *Chunk) -> usize = c.end - c.start
 private[gc] chunk_room(c: *Chunk) -> usize = c.limit - c.top
 
 // Whether `p`'s header would lie outside the part of the arena that holds blocks -- which is to say

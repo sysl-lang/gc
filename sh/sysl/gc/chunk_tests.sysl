@@ -352,7 +352,7 @@ chk_claim_reuses_mid_size_hole()
         retire(&h, &c)
         clear_roots()
 
-@test("a free block shorter than the object and its reserve, or than CLAIM_MIN, is left for the bump region")
+@test("a free block shorter than the object and its reserve is left for the bump region")
 chk_claim_skips_short_hole()
     // Shorter than `fit` for an object of CHUNK_OBJECT_MAX: it cannot hold the object.
     var block = arena(1048576 * 4)
@@ -366,18 +366,197 @@ chk_claim_skips_short_hole()
     assert_eq(used(&h), high + chunk_len_of(&h), "from the bump region")
     assert_eq(bin_length(&h, bin_of(block_length(1000))), 1, "the hole is still on its bin")
     retire(&h, &c)
+    clear_roots()
 
-    // Long enough for the object, but under CLAIM_MIN: a thread would be back at the lock at once.
+@test("a hole one grain short of the object and its reserve is left; one exactly that long is claimed")
+chk_claim_hole_at_the_fit_boundary()
+    // `fit` for a cell: its block and the reserve a retire needs. A hole of `fit` payload-plus-header
+    // is made by asking `alloc` for `fit - header` bytes, which `align_up` leaves alone.
+    val fit = block_length(sizeof(Cell)) + block_length(0)
+
+    var block = arena(1048576 * 4)
+    var h = holed_heap(block, fit - 16 - header_bytes())
+    var c = chunk()
+    val high = used(&h)
+
+    assert_eq(block_length(fit - 16 - header_bytes()), fit - 16)
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert_eq(used(&h), high + chunk_len_of(&h), "one grain short: from the bump region")
+    assert_eq(bin_length(&h, bin_of(fit - 16)), 1, "the hole is still on its bin")
+    retire(&h, &c)
+    clear_roots()
+
     var block2 = arena(1048576 * 4)
-    var h2 = holed_heap(block2, 4000)
+    var h2 = holed_heap(block2, fit - header_bytes())
     var d = chunk()
     val high2 = used(&h2)
 
-    assert(block_length(4000) < CLAIM_MIN)
     assert(claim(&h2, &d, sizeof(Cell)))
-    assert_eq(used(&h2), high2 + chunk_len_of(&h2), "from the bump region")
-    assert_eq(bin_length(&h2, bin_of(block_length(4000))), 1, "the hole is still on its bin")
+    assert_eq(used(&h2), high2, "exactly fit: the hole")
+    assert_eq(chunk_span(&d), fit)
+    assert(chunk_alloc(&d, sizeof(Cell), &cell_kind) != null, "it holds the one object")
+    assert(chunk_alloc(&d, sizeof(Cell), &cell_kind) == null, "and no second")
     retire(&h2, &d)
+    collect(&h2, &mark_roots)
+    assert_eq(live(&h2), 1, "the chunk's object was garbage; the holding cell is not")
+    clear_roots()
+
+@test("a hole exactly one object long is claimed, the object fills it to the end, and retire leaves no tail")
+chk_claim_exact_hole()
+    val block = block_length(sizeof(Cell))
+    var mem = arena(1048576 * 4)
+    var h = holed_heap(mem, block - header_bytes())
+    var c = chunk()
+    val high = used(&h)
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert_eq(used(&h), high, "the hole, not the bump region")
+    assert_eq(chunk_span(&c), block)
+    val p = chunk_alloc(&c, sizeof(Cell), &cell_kind)
+    assert(p != null, "the object fills the hole with no reserve behind it")
+    assert_eq(usize(p) - header_bytes(), usize(arena_base(&h)), "at the hole")
+    assert(chunk_alloc(&c, 0, &cell_kind) == null, "and the chunk is spent")
+    retire(&h, &c)
+    assert(bin_empty(&h, bin_of(block)), "no tail went back to a bin")
+    assert_eq(live(&h), 2)
+
+    // The arena still tiles end to end: a collection walks it, frees the chunk's object and merges
+    // nothing it should not.
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 1)
+    assert_eq(bin_length(&h, bin_of(block)), 1, "the object's block is a hole again")
+    clear_roots()
+
+@test("a chunk's last object may end exactly at the chunk's end, and one grain short of it may not")
+chk_chunk_exact_fill()
+    // A hole of two cells: the first leaves room for its reserve, the second fills to the end.
+    val block = block_length(sizeof(Cell))
+    var mem = arena(1048576 * 4)
+    var h = holed_heap(mem, 2 * block - header_bytes())
+    var c = chunk()
+
+    assert(claim(&h, &c, sizeof(Cell)))
+    assert_eq(chunk_span(&c), 2 * block)
+    assert(chunk_alloc(&c, sizeof(Cell), &cell_kind) != null)
+    assert(chunk_alloc(&c, sizeof(Cell), &cell_kind) != null, "the second fills it exactly")
+    assert(chunk_alloc(&c, 0, &cell_kind) == null)
+    retire(&h, &c)
+    assert_eq(live(&h), 3)
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), 1)
+    clear_roots()
+
+    // One grain longer than two cells: the second cell would leave a grain no header fits in, so it
+    // is refused, and the tail retire frees is a whole free block.
+    var mem2 = arena(1048576 * 4)
+    var h2 = holed_heap(mem2, 2 * block + 16 - header_bytes())
+    var d = chunk()
+
+    assert(claim(&h2, &d, sizeof(Cell)))
+    assert_eq(chunk_span(&d), 2 * block + 16)
+    assert(chunk_alloc(&d, sizeof(Cell), &cell_kind) != null)
+    assert(chunk_alloc(&d, sizeof(Cell), &cell_kind) == null, "a grain short of a header behind it")
+    retire(&h2, &d)
+    assert_eq(bin_length(&h2, bin_of(block + 16)), 1, "the tail is one free block")
+    collect(&h2, &mark_roots)
+    assert_eq(live(&h2), 1)
+    clear_roots()
+
+@test("a hole under CLAIM_MIN that holds the object is claimed whole before the bump region")
+chk_claim_reuses_short_hole()
+    // Exact small classes and geometric ones, the largest just under CLAIM_MIN.
+    for bytes in [64usize, 200, 1000, 1500, 4000, 8000]
+        var block = arena(1048576 * 4)
+        var h = holed_heap(block, bytes)
+        var c = chunk()
+        val high = used(&h)
+
+        assert(block_length(bytes) < CLAIM_MIN)
+        assert(claim(&h, &c, sizeof(Cell)))
+        assert_eq(used(&h), high, "the bump region did not move")
+        assert_eq(chunk_span(&c), block_length(bytes), "the hole, taken whole")
+        val p = chunk_alloc(&c, sizeof(Cell), &cell_kind)
+        assert(usize(p) < usize(arena_base(&h)) + block_length(bytes), "the chunk is the hole")
+        assert(bin_empty(&h, bin_of(block_length(bytes))), "and it left its bin")
+        retire(&h, &c)
+        clear_roots()
+
+// A heap whose arena starts with one free hole per entry of `sizes`, each of `block_length` of that
+// payload, every hole held apart by a live cell after it, and nothing else handed out.
+private holes_heap(block: []u8, sizes: []const usize) -> Heap
+    var h = heap(&block[0], block.len, null)
+    var last: *Cell = null
+    for bytes in sizes
+        assert(alloc(&h, bytes, &cell_kind) != null)
+        val p = alloc(&h, sizeof(Cell), &cell_kind)
+        if last == null then roots[0] = p else last.refs[0] = p
+        last = ptr_cast(p)
+    collect(&h, &mark_roots)
+    assert_eq(live(&h), sizes.len)
+    h
+
+@test("short holes are claimed longest first, and the bump region only once none holds the object")
+chk_claim_short_holes_longest_first()
+    val sizes = [200usize, 3000, 600, 1500]
+    var block = arena(1048576 * 4)
+    var h = holes_heap(block, sizes)
+    // One chunk per hole, all held out at once: a retire would give a hole's unused tail back.
+    var cs = [chunk(); 5]
+    val high = used(&h)
+    val order = [3000usize, 1500, 600, 200]
+
+    for i in 0..<order.len
+        assert(claim(&h, &cs[i], sizeof(Cell)))
+        assert_eq(chunk_span(&cs[i]), block_length(order[i]), "the longest hole left")
+        assert_eq(used(&h), high)
+
+    // Every hole is out as a chunk, so the next claim goes to the bump region.
+    assert(claim(&h, &cs[4], sizeof(Cell)))
+    assert_eq(used(&h), high + chunk_len_of(&h), "no hole left: from the bump region")
+    for i in 0..<cs.len
+        retire(&h, &cs[i])
+    clear_roots()
+
+@test("a claim searches the object's own geometric class to its end for a hole that holds it")
+chk_claim_searches_own_class()
+    // `fit` for an object of CHUNK_OBJECT_MAX lies in the class [2048, 4096). A hole in that class but
+    // short of `fit` sits at the head of the bin; a longer one in the same class sits behind it.
+    val fit = block_length(CHUNK_OBJECT_MAX) + block_length(0)
+    val short = fit - 32 - header_bytes()
+    val long = fit + 512 - header_bytes()
+
+    assert_eq(bin_of(block_length(short)), bin_of(fit))
+    assert_eq(bin_of(block_length(long)), bin_of(fit))
+
+    // The sweep pushes in address order, so the later hole is the head of the bin.
+    var block = arena(1048576 * 4)
+    var h = holes_heap(block, [long, short])
+    var c = chunk()
+    val high = used(&h)
+
+    assert_eq(bin_length(&h, bin_of(fit)), 2)
+    assert(claim(&h, &c, CHUNK_OBJECT_MAX))
+    assert_eq(used(&h), high, "the longer hole, behind the short one")
+    assert_eq(chunk_span(&c), block_length(long))
+    assert_eq(bin_length(&h, bin_of(fit)), 1, "the short one stays")
+    retire(&h, &c)
+    clear_roots()
+
+@test("last_bin is the highest class with a block, across both words of the mask, and NBINS for none")
+chk_last_bin()
+    var block = arena(1048576 * 4)
+    var h = heap(&block[0], block.len, null)
+
+    assert_eq(last_bin(&h), NBINS, "a fresh heap has every block in the bump region")
+
+    var h2 = holed_heap(block, 64)
+    assert_eq(last_bin(&h2), bin_of(block_length(64)), "one hole in the low word")
+    clear_roots()
+
+    var block3 = arena(1048576 * 4)
+    var h3 = holes_heap(block3, [64usize, 3000])
+    assert_eq(last_bin(&h3), bin_of(block_length(3000)), "the high word wins")
+    assert(bin_of(block_length(3000)) >= 64)
     clear_roots()
 
 @test("claim_least is CLAIM_MIN, or a small heap's chunk length, and never less than the object's fit")

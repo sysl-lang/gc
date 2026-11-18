@@ -1,0 +1,94 @@
+module sh.sysl.gc
+@tests
+
+// A steady heap: the high-water mark stays bounded.
+//
+// What an interpreter in a steady state does: a fixed number of live objects, each step replacing a
+// random one and making a piece of garbage, collected once as much has been allocated as the last
+// collection left live (`live_size` counts chunks whole, as a runtime's budget does), and allocated
+// through chunks, as a threaded runtime allocates. The sweep leaves a hole wherever a replaced object
+// died, a few objects long, between survivors. A claim that passed those holes over grew the arena by a
+// chunk at every claim, to five times what was live.
+
+private trace_leaf(p: *u8, h: *Heap)
+    return
+
+private var leaf_kind: Kind = Kind(&trace_leaf, null, null, null)
+
+private const STEADY_LIVE: usize = 20000
+
+private var steady_seed: u64 = 88172645463325252
+
+// xorshift64: the same objects, in the same order, on every run.
+private steady_next() -> u64
+    steady_seed = steady_seed ^ (steady_seed << 13)
+    steady_seed = steady_seed ^ (steady_seed >> 7)
+    steady_seed = steady_seed ^ (steady_seed << 17)
+    steady_seed
+
+private var steady_slots: []*u8 = []
+
+private mark_steady(h: *Heap)
+    for p in steady_slots
+        mark(h, p)
+
+private struct Steady
+    settled: usize
+    collections: usize
+    high: usize
+
+private steady_collect(h: *Heap, c: *Chunk, s: *Steady)
+    retire(h, c)
+    if used(h) > s.high then s.high = used(h)
+    collect(h, &mark_steady)
+    s.collections += 1
+    s.settled = live_size(h)
+
+private steady_take(h: *Heap, c: *Chunk, s: *Steady, size: usize) -> *u8
+    val p = chunk_alloc(c, size, &leaf_kind)
+    if p != null then return p
+    val now = live_size(h)
+    if now > s.settled && now - s.settled >= s.settled then steady_collect(h, c, s)
+    if !claim(h, c, size)
+        steady_collect(h, c, s)
+        assert(claim(h, c, size), "the arena holds the steady heap")
+    chunk_alloc(c, size, &leaf_kind)
+
+// The high-water mark over what is live, after `steps` steps of the steady workload with live objects
+// of `low` to `low + 112` payload bytes and 256 bytes of garbage a step.
+private steady_ratio(steps: usize, low: usize) -> real
+    var block: []u8 = [0; 1048576 * 64]
+    var h = heap(&block[0], block.len, null)
+    var c = chunk()
+    var s = Steady(0, 0, 0)
+
+    steady_seed = 88172645463325252
+    steady_slots = [null; STEADY_LIVE]
+    for i in 0..<STEADY_LIVE
+        steady_slots[i] = steady_take(&h, &c, &s, low + usize(steady_next() % 8) * 16)
+    for _ in 0..<steps
+        steady_slots[usize(steady_next() % u64(STEADY_LIVE))] = steady_take(&h, &c, &s, low + usize(steady_next() % 8) * 16)
+        assert(steady_take(&h, &c, &s, 256) != null)
+
+    steady_collect(&h, &c, &s)
+    assert_eq(live(&h), STEADY_LIVE, "every slot, and nothing else, survives")
+    assert(s.collections > 10, "enough collections to reach a steady state")
+    val ratio = real(s.high) / real(live_size(&h))
+    steady_slots = []
+    ratio
+
+// The bounds are what the allocator reaches with margin, and each fails without either half of the
+// fix. Measured: small objects 8.26 with holes passed over, 3.13 reusing holes that hold an object and
+// its reserve, 2.56 also reusing holes exactly one object long; tiny objects 12.46, 4.03 and 3.15.
+// Two is the floor for a budget of 100%: what survived plus as much again allocated. What is left
+// above it is holes too short for any object between survivors, the price of never moving one.
+
+@test("a steady heap of small objects keeps its high-water mark under 2.75 times what is live")
+chk_steady_high_water_small()
+    val ratio = steady_ratio(400000, 96)
+    assert(ratio < 2.75, f"high-water / live = ${ratio}%.2f")
+
+@test("a steady heap of tiny objects keeps its high-water mark under 3.4 times what is live")
+chk_steady_high_water_tiny()
+    val ratio = steady_ratio(400000, 16)
+    assert(ratio < 3.4, f"high-water / live = ${ratio}%.2f")

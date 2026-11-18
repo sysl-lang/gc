@@ -549,9 +549,12 @@ resume
   nothing in the header, which stays private.
 - **`claim` retires whatever the chunk held, then carves a fresh one, reusing free space before the
   arena grows**: a free block of at least a whole chunk, cut to one; else any free block of at least
-  8 KiB (or the chunk length where a small heap's is shorter), taken whole; then the part of the
-  arena never handed out; then — in a fragmented heap — a small chunk out of any block that holds
-  the one object. **`false` means no block holds it**:
+  8 KiB (or the chunk length where a small heap's is shorter), taken whole; else the longest free
+  block that holds the object, taken whole; else one exactly the object's length, which its object
+  fills to the end; and only then the part of the arena never handed out.
+  The holes a sweep leaves between survivors are reused, so a heap in a steady state with a budget
+  of what survived levels off at two and a half to three times what is live (two is the floor; the
+  rest is holes too short for any object) rather than growing by a chunk at every claim. **`false` means no block holds it**:
   retire every chunk, collect, claim again; a second `false` is out of memory. A chunk is a
   sixty-fourth of the arena, held between 32 and 256 KiB and never longer than the arena.
 - **Every chunk is retired before `collect` and before `dispose`, and a chunk still out traps
