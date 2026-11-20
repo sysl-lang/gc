@@ -91,7 +91,8 @@ type Ephemeron = *extern(*u8, @lets_out *Heap) -> bool
 type Roots = *extern(@lets_out *Heap) -> unit
 
 // What a heap hands back to the operating system: `len` bytes at `p`, both whole pages of the size
-// `release_pages` was given. Hosted, it is `madvise(p, len, MADV_FREE)` or `MADV_DONTNEED`; on a board
+// `release_pages` was given. Hosted, it is an in-place anonymous `mmap(..., MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0)` (not
+// `MADV_FREE`, which does not lower resident memory on macOS); on a board
 // there is nothing to call and no hook to set.
 //
 // **The heap does not read those bytes again before it writes them**, so the hook may leave them

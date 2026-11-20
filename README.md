@@ -271,7 +271,7 @@ block — is still not a legal argument; the `checks` option traps on it.
 ## Checks
 
 ```hocon
-gc { git = "github.com/sysl-lang/gc", version = "0.3.2", options = { checks = true } }
+gc { git = "github.com/sysl-lang/gc", version = "0.4.1", options = { checks = true } }
 ```
 
 The `checks` option (default `false`) validates the heap as it runs and traps on the first fault:
@@ -512,7 +512,7 @@ The block a consumer writes:
 
 ```hocon
 dependencies {
-  gc { git = "github.com/sysl-lang/gc", version = "0.3.2" }
+  gc { git = "github.com/sysl-lang/gc", version = "0.4.1" }
 }
 ```
 
@@ -606,10 +606,17 @@ client can get those pages back by giving the heap a release hook:
 
 ```sysl
 release(p: *u8, len: usize, h: *gc.Heap)
-    madvise(p, len, MADV_FREE)
+    mmap(p, len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0)
 
 gc.release_pages(&h, &release, 16384)
 ```
+
+**The host wires the hook to the OS, and gc itself makes no system call.** On macOS arm64 (page
+size 16384), re-map the range in place with an anonymous `mmap(p, len, PROT_READ|PROT_WRITE,
+MAP_FIXED|MAP_PRIVATE|MAP_ANON, -1, 0)`; in avin's measurement that took resident memory from
+1,047 MB to 11 MB. Neither `MADV_FREE` nor `MADV_FREE_REUSABLE` lowered it. `MADV_FREE_REUSABLE` is
+also unsound here, because gc hands a released run out again without a `MADV_FREE_REUSE`. Pace the
+hook: releasing on every sweep cost a churning program 1.2 s of extra system time.
 
 - **The hook is `gc.Release`, `*extern(*u8, usize, *Heap) -> unit`.** It is handed whole pages of
   the size you pass. Pass the host's real page size (16 KiB on macOS arm64, 4 KiB on most others).
@@ -631,7 +638,7 @@ gc.release_pages(&h, &release, 16384)
   whatever lock the client takes for collecting, and it must not call back into the heap.
 
 **A heap with no hook behaves exactly as it does without this feature.** A board has nothing to
-release to, and the package still asks for no operating system: the `madvise` belongs to the client.
+release to, and the package still asks for no operating system: the `mmap` belongs to the client.
 
 ## Tests
 
@@ -674,7 +681,7 @@ fail, with the weak counting dropped from `chunk_alloc` the weak-object test fai
 left uncredited at `retire` six `live_size` assertions fail.
 
 The release tests (`release_tests.sysl`) use a hook that records each range and scribbles over
-every byte of it, which is harsher than any `madvise`. They cover 4 KiB and 16 KiB pages, an arena
+every byte of it, which is harsher than any real hook. They cover 4 KiB and 16 KiB pages, an arena
 off a page boundary, the threshold one grain either side, the header surviving, `bump` falling
 (including to zero and at an arena end that is not on a page), a released run merging into the top,
 reallocating with `alloc`, `alloc_raw` and a chunk, repeated sweeps, no hook, a hook that never fires
