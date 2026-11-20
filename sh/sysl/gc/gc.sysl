@@ -90,6 +90,16 @@ type Ephemeron = *extern(*u8, @lets_out *Heap) -> bool
 // What `collect` is handed: grey every root, by calling `mark` on each.
 type Roots = *extern(@lets_out *Heap) -> unit
 
+// What a heap hands back to the operating system: `len` bytes at `p`, both whole pages of the size
+// `release_pages` was given. Hosted, it is `madvise(p, len, MADV_FREE)` or `MADV_DONTNEED`; on a board
+// there is nothing to call and no hook to set.
+//
+// **The heap does not read those bytes again before it writes them**, so the hook may leave them
+// reading as zero, as what they held, or as anything else. A range is never handed over twice without
+// the heap having handed the storage out or written a header into it in between. See
+// `release_pages`.
+type Release = *extern(*u8, usize, *Heap) -> unit
+
 // What the collector knows about one kind of object.
 //
 // **The hooks are here rather than in each object's header because three of the four are usually
@@ -160,6 +170,10 @@ private struct Header
 private const MARKED: usize = 1
 private const FREE: usize = 2
 private const FLAGS: usize = 15
+
+// Set on a free block whose every whole page past its header has been handed to the release hook and
+// not written since. Only a free block carries it; handing the block out clears it.
+private const RELEASED: usize = 4
 
 @assert(FLAGS == GRAIN - 1, "the flags sit in the bits a grain-multiple length leaves clear")
 
@@ -275,6 +289,12 @@ struct Heap
     // collections.
     private ring_at: u4
     private ring: [RING]*Header
+
+    // The hook that gives free pages back, the page size it works in, and how many bytes it has been
+    // handed since the heap was made -- see `release_pages`. `null`, 0 and 0 on a heap that has none.
+    private release: Release
+    private page: usize
+    private released: usize
 
 // How many marks a header's read waits behind its prefetch. `ring_at` is a `u4` so that it indexes the
 // ring with no bounds check and wraps on its own. Module-visible so that `mark_tests.sysl` can build
@@ -469,10 +489,15 @@ private split(h: *Heap, o: *Header, need: usize)
 
     var t: *Header = ptr_cast(usize(o) + need)
 
+    // **A remainder of a released block is still released past its own header**: its pages past that
+    // header lie inside the block's, and writing the header touched only the pages it sits on.
+    val kept = o.word & RELEASED
+
     t.kind = null
     o.word = need
 
     push_free(h, t, rest)
+    t.word |= kept
 end split
 
 // Make a block an object of `kind`, clear the caller's bytes where it asked for that, and answer the
@@ -518,6 +543,7 @@ private rebuild_free(h: *Heap)
     var off: usize = 0
     var start: usize = 0
     var run: usize = 0
+    var seen: usize = 0
 
     while off < h.bump
         var o: *Header = ptr_cast(usize(h.base) + off)
@@ -526,18 +552,86 @@ private rebuild_free(h: *Heap)
         if is_free(o)
             if run == 0 then start = off
             run += sz
+            seen |= o.word
         else
             if run > 0
-                close_run(h, start, run)
+                close_run(h, start, run, seen & RELEASED != 0)
                 run = 0
+                seen = 0
 
         off += sz
 
-    if run > 0 then close_run(h, start, run)
+    if run > 0 then close_last(h, start, run, seen & RELEASED != 0)
 end rebuild_free
 
-private close_run(h: *Heap, start: usize, run: usize)
-    push_free(h, ptr_cast(usize(h.base) + start), run)
+// Make the run of `run` free bytes at offset `start` one free block. `held` says whether some block in
+// it is already released.
+//
+// **With a release hook, a run long enough to be worth a system call gives its pages back here**, and
+// so does any run holding a block that already did, so that the flag below stays exact: every whole
+// page past the run's header is released once this returns. The header and its link are written after
+// the release, on the pages the release left alone.
+private close_run(h: *Heap, start: usize, run: usize, held: bool)
+    val o: *Header = ptr_cast(usize(h.base) + start)
+
+    if h.release == null || !held && run < RELEASE_MIN
+        push_free(h, o, run)
+        return
+
+    give_back(h, start, run, held, page_up(h, usize(o) + sizeof(Header)), page_down(h, usize(o) + run))
+    push_free(h, o, run)
+    o.word |= RELEASED
+
+// The same for the run a walk ends on, which reaches `bump`.
+//
+// **With a release hook the arena shrinks back to where the run starts** and every whole page from
+// there to `bump` is released, so the next allocation past the live data is the bump region's again.
+// That keeps one fact true for good: every whole page past `bump` is released or was never written.
+// A run too short to release is left as a free block, as without a hook, and `bump` stays put.
+private close_last(h: *Heap, start: usize, run: usize, held: bool)
+    if h.release == null || !held && run < RELEASE_MIN
+        close_run(h, start, run, held)
+        return
+
+    val at = usize(h.base) + start
+    val end = page_down(h, usize(h.base) + h.cap)
+    val top = page_up(h, at + run)
+
+    give_back(h, start, run, held, page_up(h, at), if top < end then top else end)
+    h.bump = start
+
+// Hand the hook every whole page in `lo ..< hi`, which lies inside the run at `start`, except those
+// a released block in the run already gave back. Those come in address order and never overlap, so
+// what is left is at most one range before each and one after the last.
+private give_back(h: *Heap, start: usize, run: usize, held: bool, lo: usize, hi: usize)
+    var from = lo
+
+    if held
+        var off = start
+        while off < start + run
+            val o: *Header = ptr_cast(usize(h.base) + off)
+            val w = o.word
+            val sz = w & ~FLAGS
+
+            if w & RELEASED != 0
+                val a = page_up(h, usize(o) + sizeof(Header))
+                val z = page_down(h, usize(o) + sz)
+                if a < z
+                    release_range(h, from, if a < hi then a else hi)
+                    if z > from then from = z
+
+            off += sz
+
+    release_range(h, from, hi)
+end give_back
+
+private release_range(h: *Heap, lo: usize, hi: usize)
+    if lo >= hi then return
+    h.release(ptr_cast(lo), hi - lo, h)
+    h.released += hi - lo
+
+private page_up(h: *Heap, a: usize) -> usize = (a + h.page - 1) & ~(h.page - 1)
+private page_down(h: *Heap, a: usize) -> usize = a & ~(h.page - 1)
 
 // Clear a fresh payload before the caller sees it.
 //
@@ -580,7 +674,7 @@ heap(base: *u8, cap: usize, ctx: *u8) -> Heap
     val most = ~0usize - sizeof(Header) - (GRAIN - 1)
     val left = if cap > lead then cap - lead else 0
     val room = if left > most then most else left
-    Heap(&base[lead], room, ctx, 0, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0, 0, 0, chunk_length(room), 0, 0, [null; RING])
+    Heap(&base[lead], room, ctx, 0, [null; NBINS], null, 0, 0, 0, 0u64, 0u64, 0, 0, 0, 0, 0, chunk_length(room), 0, 0, [null; RING], null, 0, 0)
 
 // How long a chunk is in an arena of `room` bytes: a sixty-fourth of it, held between 32 and 256
 // kilobytes and cut to whole grains -- and never more than the arena itself, so a small heap asks for
@@ -1135,7 +1229,8 @@ private check_heap(h: *Heap)
         val sz = size_of(o)
 
         if sz < min_block() || sz > h.bump - off then trap()
-        if o.word & FLAGS & ~FREE != 0 then trap()
+        if o.word & FLAGS & ~(FREE | RELEASED) != 0 then trap()
+        if o.word & (FREE | RELEASED) == RELEASED then trap()
         if is_free(o)
             if last_free then trap()
             free_blocks += 1
@@ -1238,6 +1333,7 @@ private sweep(h: *Heap)
     var off: usize = 0
     var start: usize = 0
     var run: usize = 0
+    var seen: usize = 0
 
     while off < h.bump
         var o: *Header = ptr_cast(usize(h.base) + off)
@@ -1247,9 +1343,11 @@ private sweep(h: *Heap)
         if w & (MARKED | FREE) == MARKED
             o.word = sz
             if run > 0
-                close_run(h, start, run)
+                close_run(h, start, run, seen & RELEASED != 0)
                 run = 0
+                seen = 0
         else
+            seen |= w
             if w & FREE == 0
                 val k = o.kind
                 if k.finalize != null then k.finalize(payload_of(o), h)
@@ -1264,7 +1362,7 @@ private sweep(h: *Heap)
 
         off += sz
 
-    if run > 0 then close_run(h, start, run)
+    if run > 0 then close_last(h, start, run, seen & RELEASED != 0)
     if option_checks then check_heap(h)
 end sweep
 
@@ -1328,11 +1426,52 @@ trace_calls(h: *Heap) -> usize = h.traced
 // loop.
 live_size(h: *Heap) -> usize = h.live_bytes
 
-// How much of the block has been handed out at least once. It never falls: a sweep returns storage
-// to the free list rather than to the block, so this is the high-water mark and not the live total.
+// How much of the block has been handed out since it was last given back. With no release hook it
+// never falls: a sweep returns storage to the free list rather than to the block, so this is the
+// high-water mark and not the live total. With one, a sweep that frees a long enough run at the top of
+// the arena lowers it to where that run starts -- see `release_pages`.
 //
 // **It is a diagnostic, not a scheduling input** -- see `live_size` for the one to threshold on.
 used(h: *Heap) -> usize = h.bump
+
+// How long a free run must be before a sweep hands its pages to the release hook: 64 KiB. A shorter
+// run is left alone, since a system call and the page faults that refill it cost more than its pages
+// are worth -- unless part of it was released already, when the rest goes too.
+const RELEASE_MIN: usize = 65536
+
+// Give this heap a hook that returns free pages to the operating system, in pages of `page` bytes;
+// `null` takes it away. **`false`, and no change, when `page` is not a power of two of at least 16.**
+// Pass the page size the host really has -- 16 KiB on macOS arm64, 4 KiB on most others -- since a
+// hook handed part of a page cannot release it.
+//
+// After each sweep, and at `dispose`, the hook is handed:
+//
+//   - **the interior of every free run of at least `RELEASE_MIN` bytes**: each whole page past the
+//     run's header. The header and its free-list link stay where they are, on pages not handed over,
+//     so the run is an ordinary free block and an allocation from it writes its own header and works.
+//   - **the top of the arena, when the run there reaches `bump` and is that long**: `bump` falls to the
+//     start of the run and every whole page from there up is handed over, so `used` falls with it.
+//
+// **A page is never handed over twice without being handed out or written in between.** A released
+// run remembers it was released, a piece split from it keeps that, and a run merged from one releases
+// only the pages it did not already. A heap with no hook does exactly what it did before this existed.
+//
+// The hook runs inside `collect` or `dispose`, so it runs wherever those do: with every chunk retired,
+// under whatever lock the client holds for collecting. It must not call back into this heap.
+release_pages(h: *Heap, hook: Release, page: usize) -> bool
+    if hook == null
+        h.release = null
+        h.page = 0
+        return true
+
+    if page < GRAIN || page & (page - 1) != 0 then return false
+
+    h.release = hook
+    h.page = page
+    true
+
+// How many bytes this heap has handed its release hook since it was made.
+released_bytes(h: *Heap) -> usize = h.released
 
 // How many free blocks the allocator has looked at since the heap was made.
 //

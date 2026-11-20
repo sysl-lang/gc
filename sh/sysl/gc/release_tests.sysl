@@ -1,0 +1,494 @@
+module sh.sysl.gc
+@tests
+
+import sysl.raw.ptr_cast
+
+// What the release hook claims, run by `sysl test .`: after a sweep the hook is handed every whole page
+// past the header of a free run of at least `RELEASE_MIN` bytes, and the top of the arena when the run
+// there reaches `bump`; a page is never handed over twice without being handed out in between; and a
+// heap with no hook lays its blocks out exactly as it did before there was one.
+//
+// **The hook here scribbles over every byte it is handed**, which is harsher than any operating system:
+// `madvise` leaves a page reading as zero or as what it held. A heap that read a released byte as
+// anything but garbage fails these tests rather than passing them by luck.
+
+private trace_rel(p: *u8, h: *Heap)
+    return
+
+private var rel_kind: Kind = Kind(&trace_rel, null, null, null)
+
+private const MAX_RANGES: usize = 16
+
+private var rel_at: [MAX_RANGES]usize = [0; MAX_RANGES]
+private var rel_len: [MAX_RANGES]usize = [0; MAX_RANGES]
+private var rel_n: usize = 0
+
+private record(p: *u8, len: usize, h: *Heap)
+    if rel_n < MAX_RANGES
+        rel_at[rel_n] = usize(p)
+        rel_len[rel_n] = len
+    rel_n += 1
+    for i in 0..<len
+        p[i] = 0xA5
+
+private var held: [4]*u8 = [null; 4]
+
+private roots_held(h: *Heap)
+    for p in held
+        mark(h, p)
+
+private reset()
+    rel_n = 0
+    for i in 0..<held.len
+        held[i] = null
+
+private up(a: usize, page: usize) -> usize = (a + page - 1) & ~(page - 1)
+private down(a: usize, page: usize) -> usize = a & ~(page - 1)
+private head(p: *u8) -> usize = usize(p) - header_bytes()
+private arena_end(h: *Heap) -> usize = usize(arena_base(h)) + arena_room(h)
+
+// A block whose first byte sits on a `page` boundary, so that where each page falls is known.
+private paged(block: []u8, page: usize) -> *u8 = ptr_cast(up(usize(&block[0]), page))
+
+private const MIB: usize = 1048576
+
+private all_zero(p: *u8, n: usize) -> bool
+    for i in 0..<n
+        if p[i] != 0 then return false
+    true
+
+// A heap of a MiB on a page boundary, with the recording hook in pages of `page` bytes.
+private hooked(block: []u8, page: usize) -> Heap
+    var h = heap(paged(block, page), MIB, null)
+    assert(release_pages(&h, &record, page), "a power of two is a page size")
+    h
+
+// -- Page alignment --------------------------------------------------------------------------------
+
+private interior_case(page: usize)
+    reset()
+    var block: []u8 = [0; MIB + page]
+    var h = hooked(block, page)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, 200000, &rel_kind)
+    held[1] = alloc(&h, 100, &rel_kind)
+    val top = used(&h)
+
+    collect(&h, &roots_held)
+
+    val lo = up(head(b) + header_bytes(), page)
+    val hi = down(head(b) + block_bytes(b), page)
+
+    assert_eq(rel_n, 1, "one free run, one range")
+    assert_eq(rel_at[0], lo, "from the first page boundary past the header")
+    assert_eq(rel_len[0], hi - lo, "to the last page boundary inside the run")
+    assert_eq(rel_at[0] % page, 0)
+    assert_eq(rel_len[0] % page, 0)
+    assert_eq(released_bytes(&h), hi - lo)
+    assert_eq(used(&h), top, "a run below live data does not move bump")
+    reset()
+
+@test("a released range is whole 4 KiB pages past the run's header")
+release_aligns_to_4k()
+    interior_case(4096)
+
+@test("a released range is whole 16 KiB pages past the run's header, as on macOS arm64")
+release_aligns_to_16k()
+    interior_case(16384)
+
+@test("an arena that starts off a page boundary still releases only whole pages inside the run")
+release_aligns_off_boundary()
+    reset()
+    val page: usize = 16384
+    var block: []u8 = [0; MIB + page]
+    var h = heap(&block[40], MIB, null)
+    assert(release_pages(&h, &record, page))
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, 300000, &rel_kind)
+    held[1] = alloc(&h, 100, &rel_kind)
+    collect(&h, &roots_held)
+
+    assert_eq(rel_n, 1)
+    assert_eq(rel_at[0] % page, 0)
+    assert_eq(rel_len[0] % page, 0)
+    assert(rel_at[0] >= head(b) + header_bytes(), "not a byte of the header")
+    assert(rel_at[0] + rel_len[0] <= head(b) + block_bytes(b), "not a byte past the run")
+    assert(rel_len[0] >= 300000 - 2 * page, "every whole page in between")
+    reset()
+
+// -- Threshold -------------------------------------------------------------------------------------
+
+private interior_of(bytes: usize) -> usize
+    reset()
+    var block: []u8 = [0; MIB + 4096]
+    var h = hooked(block, 4096)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, bytes - header_bytes(), &rel_kind)
+    assert_eq(block_bytes(b), bytes)
+    held[1] = alloc(&h, 100, &rel_kind)
+    collect(&h, &roots_held)
+    val n = rel_n
+    reset()
+    n
+
+@test("a free run one grain under RELEASE_MIN is left alone, and one of exactly RELEASE_MIN is released")
+release_threshold_interior()
+    assert_eq(interior_of(RELEASE_MIN - GRAIN), 0, "just under")
+    assert_eq(interior_of(RELEASE_MIN), 1, "just at")
+    assert_eq(interior_of(RELEASE_MIN + GRAIN), 1, "just over")
+
+private top_of(bytes: usize) -> bool
+    reset()
+    var block: []u8 = [0; MIB + 4096]
+    var h = hooked(block, 4096)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val before = used(&h)
+    alloc(&h, bytes - header_bytes(), &rel_kind)
+    val after = used(&h)
+    collect(&h, &roots_held)
+    val lowered = used(&h) == before
+    assert(lowered || used(&h) == after, "bump either falls to the run or stays")
+    assert_eq(rel_n > 0, lowered, "it falls exactly when the run is released")
+    reset()
+    lowered
+
+@test("a run at the top one grain under RELEASE_MIN keeps bump, and one of RELEASE_MIN lowers it")
+release_threshold_top()
+    assert(!top_of(RELEASE_MIN - GRAIN), "just under")
+    assert(top_of(RELEASE_MIN), "just at")
+
+// -- The header ------------------------------------------------------------------------------------
+
+@test("a released run's header and link survive, and the run is an ordinary free block")
+release_keeps_header()
+    reset()
+    var block: []u8 = [0; MIB + 16384]
+    var h = hooked(block, 16384)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, 200000, &rel_kind)
+    val bytes = block_bytes(b)
+    held[1] = alloc(&h, 100, &rel_kind)
+    collect(&h, &roots_held)
+
+    assert_eq(rel_n, 1)
+    assert(rel_at[0] >= head(b) + header_bytes(), "the scribble began past the header")
+    assert(block_free(b), "still free")
+    assert_eq(block_bytes(b), bytes, "still its own length")
+    assert_eq(bin_length(&h, bin_of(bytes)), 1, "still on the bin for its length")
+    reset()
+
+// -- Lowering bump ---------------------------------------------------------------------------------
+
+@test("a released run at the top lowers bump to its start and gives back every page above it")
+release_lowers_bump()
+    reset()
+    val page: usize = 16384
+    var block: []u8 = [0; MIB + page]
+    var h = hooked(block, page)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val before = used(&h)
+    val b = alloc(&h, 200000, &rel_kind)
+    val top = usize(arena_base(&h)) + used(&h)
+    collect(&h, &roots_held)
+
+    assert_eq(used(&h), before, "bump falls to the run's start")
+    assert_eq(rel_n, 1)
+    assert_eq(rel_at[0], up(head(b), page), "from the first boundary at or past the run")
+    assert_eq(rel_at[0] + rel_len[0], up(top, page), "through the page bump was in")
+
+    // The bump region hands the same storage out again, zeroed whatever the hook left there.
+    val again = alloc(&h, 200000, &rel_kind)
+    assert_eq(usize(again), usize(b))
+    assert(all_zero(again, 200000))
+    reset()
+
+@test("a whole heap freed lowers bump to zero")
+release_empties_heap()
+    reset()
+    var block: []u8 = [0; MIB + 4096]
+    var h = hooked(block, 4096)
+
+    for i in 0..<10
+        alloc(&h, 30000, &rel_kind)
+    collect(&h, &roots_held)
+
+    assert_eq(used(&h), 0)
+    assert_eq(rel_n, 1)
+    assert_eq(rel_at[0], up(usize(arena_base(&h)), 4096))
+    assert(alloc(&h, 500000, &rel_kind) != null, "and the arena is whole again")
+    reset()
+
+@test("a release at the top stops at the last whole page of an arena whose end is not on one")
+release_clamps_to_arena_end()
+    reset()
+    val page: usize = 4096
+    var block: []u8 = [0; MIB + 2 * page]
+    var h = heap(paged(block, page), MIB + 5000, null)
+    assert(release_pages(&h, &record, page))
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val fill = (arena_room(&h) - used(&h) - header_bytes()) & ~(GRAIN - 1)
+    assert(alloc(&h, fill, &rel_kind) != null)
+    assert(arena_end(&h) - (usize(arena_base(&h)) + used(&h)) < GRAIN, "filled to the end")
+    collect(&h, &roots_held)
+
+    assert_eq(rel_n, 1)
+    assert_eq(rel_at[0] + rel_len[0], down(arena_end(&h), page), "not into a page the arena only partly owns")
+    reset()
+
+@test("a run at the top that merges a released run releases only what that run did not")
+release_run_adjacent_to_bump()
+    reset()
+    val page: usize = 16384
+    var block: []u8 = [0; MIB + page]
+    var h = hooked(block, page)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val before = used(&h)
+    val b = alloc(&h, 200000, &rel_kind)
+    val run_end = head(b) + block_bytes(b)
+    held[1] = alloc(&h, 50000, &rel_kind)
+    val top = usize(arena_base(&h)) + used(&h)
+
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 1, "the run below the live top object is released")
+    val first_at = rel_at[0]
+    val first_len = rel_len[0]
+
+    held[1] = null
+    collect(&h, &roots_held)
+
+    assert_eq(used(&h), before, "bump falls past both")
+    var total = first_len
+    for i in 1..<rel_n
+        total += rel_len[i]
+        val clear = rel_at[i] + rel_len[i] <= first_at || rel_at[i] >= first_at + first_len
+        assert(clear, "nothing released twice")
+    assert_eq(total, up(top, page) - up(head(b), page), "together they cover the top exactly")
+    assert(rel_n >= 2, "the pages above the old run went this time")
+    assert(run_end <= top)
+    reset()
+
+// -- Reuse -----------------------------------------------------------------------------------------
+
+@test("a released run is allocated from again, zeroed by alloc and writable to its end by alloc_raw")
+release_run_reallocates()
+    reset()
+    var block: []u8 = [0; MIB + 16384]
+    var h = hooked(block, 16384)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, 200000, &rel_kind)
+    held[1] = alloc(&h, 100, &rel_kind)
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 1)
+
+    val again = alloc(&h, 200000, &rel_kind)
+    assert_eq(usize(again), usize(b), "the released run is the block it hands out")
+    assert(all_zero(again, 200000), "alloc clears what the hook left")
+    held[2] = again
+    collect(&h, &roots_held)
+    assert_eq(live(&h), 3)
+
+    held[2] = null
+    collect(&h, &roots_held)
+    val raw = alloc_raw(&h, 200000, &rel_kind)
+    assert_eq(usize(raw), usize(b))
+    for i in 0..<200000
+        raw[i] = u8(i & 255)
+    held[2] = raw
+    collect(&h, &roots_held)
+    assert_eq(raw[199999], u8(199999 & 255), "a live object's bytes are its own")
+    assert_eq(kind_of(raw), &rel_kind)
+    reset()
+
+@test("a chunk claimed from a released run works, and retiring it releases only what the chunk held")
+release_run_feeds_a_chunk()
+    reset()
+    val page: usize = 4096
+    var block: []u8 = [0; MIB + page]
+    var h = hooked(block, page)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, 300000, &rel_kind)
+    held[1] = alloc(&h, 100, &rel_kind)
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 1)
+
+    var c = chunk()
+    assert(claim(&h, &c, 64))
+    val span = chunk_span(&c)
+    for i in 0..<100
+        assert(chunk_alloc(&c, 64, &rel_kind) != null)
+    retire(&h, &c)
+    collect(&h, &roots_held)
+
+    assert_eq(rel_n, 2, "the chunk's pages go back once it is dead")
+    assert_eq(rel_at[1], up(head(b) + header_bytes(), page))
+    assert_eq(rel_at[1] + rel_len[1], up(head(b) + span + header_bytes(), page), "and nothing past it")
+    reset()
+
+// -- Never twice -----------------------------------------------------------------------------------
+
+@test("repeated sweeps hand over no range twice, and a piece split off keeps what was released")
+release_never_twice()
+    reset()
+    val page: usize = 4096
+    var block: []u8 = [0; MIB + page]
+    var h = hooked(block, page)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, 200000, &rel_kind)
+    held[1] = alloc(&h, 100, &rel_kind)
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 1)
+    val first = rel_len[0]
+
+    collect(&h, &roots_held)
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 1, "an untouched run is not released again")
+
+    // A piece from the front, kept live: the rest is under RELEASE_MIN, and still released.
+    val x = alloc(&h, 150000, &rel_kind)
+    assert_eq(usize(x), usize(b))
+    held[2] = x
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 1, "the remainder remembers")
+
+    // The piece dies and merges back: only its own pages go.
+    val rest = head(b) + block_bytes(x)
+    held[2] = null
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 2)
+    assert_eq(rel_at[1], up(head(b) + header_bytes(), page))
+    assert_eq(rel_at[1] + rel_len[1], up(rest + header_bytes(), page))
+    assert_eq(released_bytes(&h), first + rel_len[1])
+
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 2, "and then nothing more")
+    reset()
+
+// -- No hook ---------------------------------------------------------------------------------------
+
+@test("with no hook a free run is never released and bump never falls")
+release_none_without_hook()
+    reset()
+    var block: []u8 = [0; MIB + 4096]
+    var h = heap(paged(block, 4096), MIB, null)
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val b = alloc(&h, 200000, &rel_kind)
+    held[1] = alloc(&h, 100, &rel_kind)
+    val c = alloc(&h, 200000, &rel_kind)
+    val top = used(&h)
+    collect(&h, &roots_held)
+
+    assert_eq(rel_n, 0)
+    assert_eq(released_bytes(&h), 0)
+    assert_eq(used(&h), top, "the top run stays a free block")
+    assert(block_free(b) && block_free(c))
+    reset()
+
+// The sequence of block lengths and free flags from the arena's base to `bump`.
+private same_layout(a: *Heap, b: *Heap) -> bool
+    if used(a) != used(b) || live(a) != live(b) || live_size(a) != live_size(b) then return false
+    var off: usize = 0
+    while off < used(a)
+        val p: *u8 = ptr_cast(usize(arena_base(a)) + off + header_bytes())
+        val q: *u8 = ptr_cast(usize(arena_base(b)) + off + header_bytes())
+        if block_bytes(p) != block_bytes(q) || block_free(p) != block_free(q) then return false
+        off += block_bytes(p)
+    true
+
+private var churn_slots: [64]*u8 = [null; 64]
+
+private roots_churn(h: *Heap)
+    for p in churn_slots
+        mark(h, p)
+
+// Sixty-four live objects, each round replacing them at random with new ones of up to 255 bytes: free
+// runs come and go between survivors, and none comes near `RELEASE_MIN`.
+private churn(h: *Heap)
+    for i in 0..<churn_slots.len
+        churn_slots[i] = null
+    var seed: u64 = 7
+    for _ in 0..<30
+        for _ in 0..<64
+            seed = seed *% 6364136223846793005 +% 1442695040888963407
+            churn_slots[usize(seed >> 58)] = alloc(h, usize(seed >> 24) & 255, &rel_kind)
+        collect(h, &roots_churn)
+    for i in 0..<churn_slots.len
+        churn_slots[i] = null
+
+@test("a hook that never sees a run long enough changes nothing about the heap")
+release_hook_below_threshold_is_inert()
+    reset()
+    var one: []u8 = [0; MIB + 4096]
+    var two: []u8 = [0; MIB + 4096]
+    var plain = heap(paged(one, 4096), MIB, null)
+    var hooked_heap = hooked(two, 4096)
+
+    churn(&plain)
+    reset()
+    churn(&hooked_heap)
+
+    assert_eq(rel_n, 0, "every run here is short")
+    assert(same_layout(&plain, &hooked_heap), "the same blocks, free and live, in the same places")
+    reset()
+
+// -- Errors and edges ------------------------------------------------------------------------------
+
+@test("a page size that is not a power of two of at least 16 is refused, and the heap is unchanged")
+release_refuses_bad_pages()
+    reset()
+    var block: []u8 = [0; MIB + 4096]
+    var h = heap(paged(block, 4096), MIB, null)
+
+    for bad in [0usize, 1, 3, 8, 24, 4097, 12288]
+        assert(!release_pages(&h, &record, bad), "refused")
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    alloc(&h, 200000, &rel_kind)
+    held[1] = alloc(&h, 100, &rel_kind)
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 0, "no refused call left a hook behind")
+
+    assert(release_pages(&h, &record, 16), "16 is the least page")
+    reset()
+
+@test("a null hook takes the hook away")
+release_null_removes_hook()
+    reset()
+    var block: []u8 = [0; MIB + 4096]
+    var h = hooked(block, 4096)
+    assert(release_pages(&h, null, 0), "null needs no page size")
+
+    held[0] = alloc(&h, 100, &rel_kind)
+    val before = used(&h)
+    alloc(&h, 200000, &rel_kind)
+    collect(&h, &roots_held)
+    assert_eq(rel_n, 0)
+    assert(used(&h) > before, "bump stays where it was")
+    reset()
+
+@test("dispose with a hook gives the whole arena back and leaves it usable")
+release_on_dispose()
+    reset()
+    var block: []u8 = [0; MIB + 4096]
+    var h = hooked(block, 4096)
+
+    held[0] = alloc(&h, 300000, &rel_kind)
+    held[1] = alloc(&h, 300000, &rel_kind)
+    dispose(&h)
+
+    assert_eq(used(&h), 0)
+    assert_eq(rel_n, 1)
+    assert(released_bytes(&h) >= 600000 - 4096)
+    reset()
+    assert(alloc(&h, 900000, &rel_kind) != null)

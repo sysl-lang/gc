@@ -598,6 +598,41 @@ resume
 A client that never claims pays nothing: `alloc`, `alloc_raw`, `mark` and the sweep carry no chunk
 code on their paths.
 
+## Giving pages back
+
+A sweep puts free runs back on the free lists, but without help the pages under them stay
+resident. After a burst of allocation is dropped, the process keeps its peak footprint. A hosted
+client can get those pages back by giving the heap a release hook:
+
+```sysl
+release(p: *u8, len: usize, h: *gc.Heap)
+    madvise(p, len, MADV_FREE)
+
+gc.release_pages(&h, &release, 16384)
+```
+
+- **The hook is `gc.Release`, `*extern(*u8, usize, *Heap) -> unit`.** It is handed whole pages of
+  the size you pass. Pass the host's real page size (16 KiB on macOS arm64, 4 KiB on most others).
+  `release_pages` answers `false`, and changes nothing, when that size is not a power of two of at
+  least 16. Passing `null` removes the hook.
+- **After each sweep, and at `dispose`, every free run of at least `gc.RELEASE_MIN` (64 KiB) is
+  released.** That means each whole page past the run's header. The header and its free-list link
+  stay where they were, so the run is still an ordinary free block, and an allocation from it
+  works whether the hook left the pages zero, stale or anything else. `alloc` still zeroes;
+  `alloc_raw` still hands out whatever is there.
+- **When that run is the last one and reaches the top of the arena, the arena shrinks.** `used`
+  falls to the start of the run, and every whole page from there up is released. The next
+  allocation past the live data then comes from the bump region again.
+- **A page is never released twice unless it was handed out or written in between.** A released
+  run remembers that it was released, and a piece split off it keeps the mark. A run merged from
+  released pieces releases only the pages the pieces had not already released. `released_bytes`
+  counts every byte handed to the hook.
+- **The hook runs inside `collect` or `dispose`.** So it runs with every chunk retired, under
+  whatever lock the client takes for collecting, and it must not call back into the heap.
+
+**A heap with no hook behaves exactly as it does without this feature.** A board has nothing to
+release to, and the package still asks for no operating system: the `madvise` belongs to the client.
+
 ## Tests
 
 ```
@@ -637,6 +672,13 @@ heap state has changed.
 The chunk tests (`chunk_tests.sysl`) are checked the same way: with the reserve dropped ten of them
 fail, with the weak counting dropped from `chunk_alloc` the weak-object test fails, and with the tail
 left uncredited at `retire` six `live_size` assertions fail.
+
+The release tests (`release_tests.sysl`) use a hook that records each range and scribbles over
+every byte of it, which is harsher than any `madvise`. They cover 4 KiB and 16 KiB pages, an arena
+off a page boundary, the threshold one grain either side, the header surviving, `bump` falling
+(including to zero and at an arena end that is not on a page), a released run merging into the top,
+reallocating with `alloc`, `alloc_raw` and a chunk, repeated sweeps, no hook, a hook that never fires
+laying out the heap identically to none, refused page sizes, removing the hook, and `dispose`.
 
 The mark tests (`mark_tests.sysl`) check every node of random graphs, chains, cycles and a 100,000-wide
 fan-out against a reachability walk of their own, through `trace_calls`, `live` and a finalizer that
